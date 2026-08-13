@@ -1798,6 +1798,170 @@ def test_annotate_does_not_change_evaluation(m):
         bpy.data.node_groups.remove(tree)
 
 
+def _rig_with_vertex_group(name):
+    """An armature + a mesh it deforms, sharing one bone/vertex-group name.
+
+    The minimum setup that reproduces Blender's own rename cascade: a
+    vertex group only follows a bone rename when the mesh has an Armature
+    modifier pointing at that armature - without the modifier, renaming the
+    bone leaves the vertex group alone.
+    """
+    import bpy
+    arm_data = bpy.data.armatures.new(f"{name}_arm_data")
+    arm_obj = bpy.data.objects.new(f"{name}_arm", arm_data)
+    bpy.context.scene.collection.objects.link(arm_obj)
+    bpy.context.view_layer.objects.active = arm_obj
+    bpy.ops.object.mode_set(mode='EDIT')
+    eb = arm_data.edit_bones.new("original")
+    eb.head = (0, 0, 0)
+    eb.tail = (0, 0, 1)
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    mesh = bpy.data.meshes.new(f"{name}_mesh")
+    mesh.from_pydata([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [], [(0, 1, 2)])
+    mesh_obj = bpy.data.objects.new(f"{name}_mesh_obj", mesh)
+    bpy.context.scene.collection.objects.link(mesh_obj)
+    mesh_obj.vertex_groups.new(name="original")
+    mod = mesh_obj.modifiers.new(name="Armature", type='ARMATURE')
+    mod.object = arm_obj
+    return arm_obj, mesh_obj
+
+
+def _drop_rig(name):
+    import bpy
+    for obj_name in (f"{name}_arm", f"{name}_mesh_obj"):
+        obj = bpy.data.objects.get(obj_name)
+        if obj is not None:
+            bpy.data.objects.remove(obj)
+    arm_data = bpy.data.armatures.get(f"{name}_arm_data")
+    if arm_data is not None:
+        bpy.data.armatures.remove(arm_data)
+    mesh = bpy.data.meshes.get(f"{name}_mesh")
+    if mesh is not None:
+        bpy.data.meshes.remove(mesh)
+
+
+def test_rename_bone_cascades_to_vertex_group_and_reports_it(m):
+    """The exact bug this command exists to prevent: renaming a bone silently
+    renames the matching vertex group too, as a side effect of the assignment
+    - before any of the caller's own code runs. A caller that counts its own
+    loop iterations undercounts; the diff, built from real before/after
+    state, reports both renames from one requested rename.
+    """
+    import bpy
+    arm_obj, mesh_obj = _rig_with_vertex_group("__rename_cascade__")
+    m.undo.reset()
+    bpy.ops.ed.undo_push(message="baseline for cascade rename")
+    try:
+        result = m.BlenderDevMCPServer().rename(
+            kind="bone", renames={"original": "renamed"},
+            object_name=arm_obj.name, undo_label="rename cascade test")
+        assert result["requested"] == 1, result
+        assert result["applied"] == 1, result
+        assert result["missing"] == [], result
+        bones_renamed = result["changed"]["bones"]["renamed"]
+        vg_renamed = result["changed"]["vertex_groups"]["renamed"]
+        assert {"from": "original", "to": "renamed"} in bones_renamed, result
+        assert {"from": "original", "to": "renamed"} in vg_renamed, result
+        # Blender's cascade did this, not a second call from this command.
+        assert mesh_obj.vertex_groups[0].name == "renamed"
+    finally:
+        _drop_rig("__rename_cascade__")
+
+
+def test_rename_reports_missing_names_without_raising(m):
+    tree = _undo_baseline(m, "__rename_missing__")
+    try:
+        result = m.BlenderDevMCPServer().rename(
+            kind="node_group",
+            renames={"__rename_missing__": "__rename_missing_renamed__",
+                    "__rename_does_not_exist__": "whatever"},
+            undo_label="rename with one bad name")
+        assert result["applied"] == 1, result
+        assert result["missing"] == ["__rename_does_not_exist__"], result
+        import bpy
+        assert "__rename_missing_renamed__" in bpy.data.node_groups
+    finally:
+        _drop_tree("__rename_missing__")
+        _drop_tree("__rename_missing_renamed__")
+
+
+def test_rename_reports_collisions_when_blender_dedupes(m):
+    """Renaming into a name that's already taken doesn't raise - Blender
+    appends .001 - so the report has to say so explicitly rather than let a
+    silently-different name pass as the plain rename that was asked for."""
+    import bpy
+    bpy.data.node_groups.new("__rename_collide_a__", "GeometryNodeTree")
+    bpy.data.node_groups.new("__rename_collide_taken__", "GeometryNodeTree")
+    m.undo.reset()
+    bpy.ops.ed.undo_push(message="baseline for collision rename")
+    try:
+        result = m.BlenderDevMCPServer().rename(
+            kind="node_group",
+            renames={"__rename_collide_a__": "__rename_collide_taken__"},
+            undo_label="rename into a taken name")
+        assert result["applied"] == 1, result
+        assert len(result["collisions"]) == 1, result
+        collision = result["collisions"][0]
+        assert collision["requested_from"] == "__rename_collide_a__", collision
+        assert collision["requested_to"] == "__rename_collide_taken__", collision
+        assert collision["actual"] != "__rename_collide_taken__", collision
+    finally:
+        for ng in list(bpy.data.node_groups):
+            if ng.name.startswith("__rename_collide"):
+                bpy.data.node_groups.remove(ng)
+
+
+def test_rename_dry_run_reverts(m):
+    tree = _undo_baseline(m, "__rename_dry__")
+    try:
+        result = m.BlenderDevMCPServer().rename(
+            kind="node_group",
+            renames={"__rename_dry__": "__rename_dry_done__"}, dry_run=True)
+        assert result["dry_run"] is True, result
+        assert result["reverted"] is True, result
+        renamed = result["changed"]["node_groups"]["renamed"]
+        assert {"from": "__rename_dry__", "to": "__rename_dry_done__"} in renamed, result
+        import bpy
+        assert "__rename_dry__" in bpy.data.node_groups
+        assert "__rename_dry_done__" not in bpy.data.node_groups
+    finally:
+        _drop_tree("__rename_dry__")
+        _drop_tree("__rename_dry_done__")
+
+
+def test_rename_unknown_kind_raises(m):
+    try:
+        m.BlenderDevMCPServer().rename(kind="not_a_real_kind", renames={"a": "b"})
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert "Unknown kind" in str(exc), exc
+
+
+def test_rename_contextual_kind_without_object_name_raises(m):
+    try:
+        m.BlenderDevMCPServer().rename(kind="bone", renames={"a": "b"})
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert "object_name" in str(exc), exc
+
+
+def test_rename_bone_kind_rejects_non_armature_object(m):
+    import bpy
+    mesh = bpy.data.meshes.new("__rename_wrong_type_mesh__")
+    obj = bpy.data.objects.new("__rename_wrong_type_obj__", mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    try:
+        m.BlenderDevMCPServer().rename(
+            kind="bone", renames={"a": "b"}, object_name=obj.name)
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert "not an Armature" in str(exc), exc
+    finally:
+        bpy.data.objects.remove(obj)
+        bpy.data.meshes.remove(mesh)
+
+
 def main():
     module = _load()
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

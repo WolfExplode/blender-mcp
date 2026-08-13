@@ -918,6 +918,18 @@ class BlenderDevMCPServer:
         but only for a caller who noticed and chose to spend it. Partial state
         from a failed script is essentially never what anyone wanted, so the
         default is to spend it automatically and report that it was spent.
+
+        Renaming a Bone (`armature.bones[i].name = ...`) is not just a bones
+        change: Blender's own rename handler cascades it to the matching
+        vertex group on every mesh with an Armature modifier targeting that
+        armature, synchronously, before the assignment statement returns. A
+        caller that renames bones and then separately loops over
+        `mesh.vertex_groups` looking for the old names to rename them too will
+        find most already renamed out from under it - the loop's own change
+        counter undercounts because Blender did the work first. `state.diff`
+        is unaffected (it fingerprints real state, not code paths), so it is
+        the source of truth for "what actually changed," not a counter kept
+        inside the executed code.
         """
         # Pre-import what almost every snippet needs. `__name__` is set to a
         # non-"__main__" value on purpose: without it `if __name__ ==
@@ -1029,6 +1041,162 @@ class BlenderDevMCPServer:
             result["reverted"] = reverted
             if revert_error:
                 result["revert_error"] = revert_error
+        return result
+
+    # bpy.data collections `rename` can target directly: {kind: attr on bpy.data}.
+    _RENAME_DATABLOCK_KINDS = {
+        "object": "objects", "mesh": "meshes", "material": "materials",
+        "armature": "armatures", "action": "actions", "image": "images",
+        "collection": "collections", "node_group": "node_groups",
+        "curve": "curves", "camera": "cameras", "light": "lights",
+        "texture": "textures", "world": "worlds", "text": "texts",
+        "scene": "scenes",
+    }
+
+    # Kinds that live inside an object rather than in bpy.data, and so need
+    # object_name. These three are exactly the ones state.py's `_subitems`
+    # fingerprints, which is not a coincidence: they are the sub-item kinds
+    # whose name doubles as the only link something else holds to them (a
+    # vertex group looked up by name from a modifier, a bone looked up by name
+    # from an F-Curve path), so Blender itself maintains that link on rename -
+    # see the cascade note on `rename` below.
+    _RENAME_CONTEXTUAL_KINDS = ("bone", "vertex_group", "shape_key")
+
+    def _rename_collection(self, kind, object_name):
+        """The bpy_prop_collection `rename()` should look old names up in."""
+        if kind in self._RENAME_DATABLOCK_KINDS:
+            return getattr(bpy.data, self._RENAME_DATABLOCK_KINDS[kind])
+
+        if kind not in self._RENAME_CONTEXTUAL_KINDS:
+            known = ", ".join(sorted(self._RENAME_DATABLOCK_KINDS) +
+                              list(self._RENAME_CONTEXTUAL_KINDS))
+            raise ValueError(f"Unknown kind: {kind!r}. Known: {known}")
+        if not object_name:
+            raise ValueError(
+                f"kind={kind!r} needs object_name - {kind}s live on an "
+                "object, not in bpy.data directly")
+        obj = self._resolve_name(bpy.data.objects, object_name, "Object")
+
+        if kind == "bone":
+            if obj.type != 'ARMATURE':
+                raise ValueError(
+                    f"{object_name!r} is a {obj.type} object, not an "
+                    "Armature - bones live on the armature that deforms a "
+                    "mesh, not on the mesh itself")
+            return obj.data.bones
+        if kind == "vertex_group":
+            if not hasattr(obj, "vertex_groups"):
+                raise ValueError(f"{object_name!r} ({obj.type}) has no vertex_groups")
+            return obj.vertex_groups
+        # kind == "shape_key"
+        if not (obj.data and getattr(obj.data, "shape_keys", None)):
+            raise ValueError(f"{object_name!r} has no shape keys")
+        return obj.data.shape_keys.key_blocks
+
+    @command("rename")
+    def rename(self, kind, renames, object_name=None, dry_run=False,
+              undo_label=None, max_diff_items=100):
+        """Rename a batch of same-kind items and report every knock-on change.
+
+        Exists because Blender's own renaming is not a simple attribute write.
+        For a handful of kinds - bone, vertex_group, and (in some Blender
+        versions) shape_key - the name is not just a label, it is the only
+        link something else holds: a modifier's `vertex_group` field, an
+        F-Curve's `pose.bones["Name"]` data path, a driver on
+        `key_blocks["Name"].value`. So Blender's own name-property setter
+        cascades the rename to every one of those references *before the
+        assignment statement returns* - most visibly, renaming a bone renames
+        the matching vertex group on every mesh with an Armature modifier
+        pointing at that armature. Code that renames things by hand and keeps
+        its own `count += 1` will therefore under- or over-count: the cascade
+        already did work the code's own loop expected to do itself, or the
+        loop runs into a collection where the earlier state it was matching
+        against has already moved. This command never counts renames itself;
+        it reports the real before/after diff instead, the same fingerprint
+        `execute_blender_code` uses, so the number returned is what actually
+        changed rather than what the loop believed it did.
+
+        Parameters:
+        - kind: What's being renamed. Either a bpy.data collection - "object",
+          "mesh", "material", "armature", "action", "image", "collection",
+          "node_group", "curve", "camera", "light", "texture", "world",
+          "text", "scene" - or one of the three cascading sub-item kinds -
+          "bone", "vertex_group", "shape_key" - which need object_name.
+        - renames: {old_name: new_name}. Every old_name is looked up in the
+          same pass; a name missing from the collection is reported rather
+          than raising, so one typo in a batch of 400 doesn't cost the rest.
+        - object_name: Required for bone/vertex_group/shape_key - the
+          armature (for bone) or mesh (for vertex_group/shape_key) that owns
+          them. Ignored for bpy.data kinds.
+        - dry_run: Apply for real, report the diff, then revert - see
+          execute_blender_code's dry_run for why this is the only way to
+          preview a rename whose cascade radius isn't already known.
+        - undo_label: Defaults to "rename N <kind>(s)"; renaming always
+          writes; there's no read-only case where a label can be skipped.
+        - max_diff_items: Cap per change kind (default 100, 0 = no cap), see
+          execute_blender_code.
+
+        A requested rename can also collide: two old names that map to the
+        same new one, or a new name already taken in that collection. Blender
+        resolves this itself by appending ".001" rather than raising, which
+        would silently produce a name nobody asked for - so every applied
+        rename whose actual resulting name differs from what was requested is
+        reported under "collisions", not buried in the diff as a plain rename.
+        """
+        collection = self._rename_collection(kind, object_name)
+
+        label = undo_label or f"rename {len(renames)} {kind}(s)"
+        boundary = undo.push(f"before MCP {label}", counts=False)
+        if dry_run and not boundary:
+            raise Exception(
+                "Cannot dry-run here: Blender would not accept an undo push, "
+                "so the change could not be guaranteed revertible and was "
+                "not made at all. Re-send without dry_run only if you mean "
+                "to keep it.")
+
+        before = state.fingerprint()
+        applied, missing, collisions = [], [], []
+        try:
+            for old, new in renames.items():
+                item = collection.get(old)
+                if item is None:
+                    missing.append(old)
+                    continue
+                item.name = new
+                applied.append(old)
+                if item.name != new:
+                    collisions.append({"requested_from": old,
+                                       "requested_to": new,
+                                       "actual": item.name})
+        except Exception:
+            after = state.fingerprint()
+            pushed = undo.push(f"MCP {label}")
+            changes = state.diff(before, after)
+            if pushed:
+                undo.undo(1)
+            raise Exception(
+                f"rename failed after {len(applied)} of {len(renames)} "
+                f"succeeded; rolled back.\n"
+                f"{json.dumps(state.summarise(changes, max_diff_items), indent=2, ensure_ascii=False)}")
+
+        after = state.fingerprint()
+        pushed = undo.push(f"MCP {label}")
+        changes = state.diff(before, after)
+
+        reverted = False
+        if pushed and dry_run:
+            undo.undo(1)
+            reverted = True
+
+        result = {"requested": len(renames), "applied": len(applied), "missing": missing}
+        if collisions:
+            result["collisions"] = collisions
+        result.update(state.summarise(changes, max_diff_items))
+        if dry_run:
+            result["dry_run"] = True
+            result["reverted"] = reverted
+        else:
+            result["undo_budget"] = undo.budget()
         return result
 
     @command("list_node_trees")

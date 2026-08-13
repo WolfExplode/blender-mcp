@@ -492,6 +492,17 @@ def execute_blender_code(ctx: Context, code: str, undo_label: str = None,
     metadata, custom collections) is invisible, and if that state is keyed by
     datablock name, a rename is the risky edit that won't show. Print
     post-state yourself for anything the diff can't see.
+
+    The opposite surprise: renaming a bone (`armature.bones[i].name = ...`)
+    cascades inside Blender itself, renaming the matching vertex group on
+    every mesh with an Armature modifier pointing at that armature - before
+    your code's next line runs. The diff reports this correctly because it
+    fingerprints real before/after state, but a manual counter in your own
+    code (`if vg.name == old: vg.name = new; count += 1`) will undercount,
+    since Blender already did the rename for you and your check silently
+    no-ops. When bone and vertex-group renames land in the same call, trust
+    the returned diff's totals over anything your code printed - don't
+    re-derive the count yourself.
     """
     result = get_blender_connection().send_command(
         "execute_code", {"code": code, "undo_label": undo_label,
@@ -528,6 +539,84 @@ def execute_blender_code(ctx: Context, code: str, undo_label: str = None,
     if output != "(no output)":
         report.append("--- output ---")
         report.append(output)
+    return "\n".join(report)
+
+
+@mcp.tool()
+def rename_items(ctx: Context, kind: str, renames: dict, object_name: str = None,
+                 dry_run: bool = False, undo_label: str = None,
+                 max_diff_items: int = 100) -> str:
+    """Rename a batch of same-kind items and report every knock-on change.
+
+    Use this instead of writing your own rename loop in execute_blender_code,
+    for any of the kinds listed below. The reason is not convenience: for
+    bone, vertex_group, and shape_key specifically, the name is not just a
+    label, it is the only link something else holds - a modifier's
+    `vertex_group` field, an F-Curve's `pose.bones["Name"]` data path. Blender
+    itself cascades a rename of one of these to every such reference
+    *synchronously*, before the assignment statement that triggered it
+    returns - most visibly, renaming a bone renames the matching vertex group
+    on every mesh with an Armature modifier pointing at that armature. Code
+    that renames things by hand and keeps its own counter will under- or
+    over-count, because Blender already did part of the work the loop
+    expected to do itself. This tool never counts renames from inside the
+    loop; it reports the same pointer-based before/after diff
+    execute_blender_code uses, so the number that comes back is what actually
+    changed, not what the loop believed it did.
+
+    Parameters:
+    - kind: What's being renamed. A bpy.data collection - "object", "mesh",
+      "material", "armature", "action", "image", "collection", "node_group",
+      "curve", "camera", "light", "texture", "world", "text", "scene" - or one
+      of the three cascading sub-item kinds - "bone", "vertex_group",
+      "shape_key" - which need object_name.
+    - renames: {old_name: new_name}. A name missing from the collection is
+      reported rather than raising, so one typo in a batch of 400 doesn't cost
+      the rest.
+    - object_name: Required for bone/vertex_group/shape_key - the armature
+      (for bone) or mesh (for vertex_group/shape_key) that owns them. Ignored
+      for bpy.data kinds.
+    - dry_run: Apply for real, report the diff, then revert. Reach for this
+      when the cascade radius of a rename isn't already known - a bone rename
+      on a rig you didn't build, a vertex group shared across meshes you
+      haven't all inspected.
+    - undo_label: Defaults to "rename N <kind>(s)".
+    - max_diff_items: Cap per change kind (default 100, 0 = no cap); see
+      execute_blender_code.
+
+    A rename can also collide: two old names mapping to the same new one, or a
+    new name already taken in that collection. Blender resolves this itself by
+    appending ".001" rather than raising - so every applied rename whose
+    actual result differs from what was requested comes back under
+    "collisions" in the report, not silently buried inside the diff as if it
+    were the plain rename that was asked for.
+    """
+    result = get_blender_connection().send_command(
+        "rename", {"kind": kind, "renames": renames, "object_name": object_name,
+                   "dry_run": dry_run, "undo_label": undo_label,
+                   "max_diff_items": max_diff_items})
+
+    header = f"requested {result.get('requested', 0)}, applied {result.get('applied', 0)}"
+    if result.get("dry_run"):
+        header += (" [dry run - nothing kept]" if result.get("reverted") else
+                   " [dry run - WARNING: could not be reverted, still applied]")
+    else:
+        header += " [written and undo-pushed]"
+    report = [header]
+
+    if result.get("missing"):
+        report.append(f"missing (not found, skipped): {result['missing']}")
+    if result.get("collisions"):
+        report.append("collisions (Blender changed the requested name to "
+                      f"avoid a clash): {json.dumps(result['collisions'], ensure_ascii=False)}")
+
+    changed = result.get("changed") or {}
+    if changed:
+        report.append(json.dumps({"changed": changed,
+                                  "totals": result.get("totals", {})},
+                                 indent=2, ensure_ascii=False))
+    else:
+        report.append("No further datablocks were created, deleted or renamed as a side effect.")
     return "\n".join(report)
 
 
