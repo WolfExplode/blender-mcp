@@ -80,6 +80,7 @@ READ_ONLY_COMMANDS = frozenset({
     "validate_node_tree",
     "get_collection_tree",
     "find_objects",
+    "get_object_tree",
 })
 
 
@@ -364,6 +365,33 @@ def find_objects(ctx: Context, name_contains: str = None, type: str = None,
         {"name_contains": name_contains, "type": type, "collection": collection,
          "visible_only": visible_only, "selected_only": selected_only,
          "max_results": max_results})
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+def get_object_tree(ctx: Context, name: str = None, max_items: int = 25) -> str:
+    """Read one level of the Outliner's object-parenting tree.
+
+    This is a different hierarchy from get_collection_tree: the Outliner also
+    nests objects under their parent object (Object.parent), independent of
+    which collection they're in. mmd_tools rigs are the case this matters for
+    - hundreds of rigidbody and joint empties parented under helper objects
+    like "rigidbodies" rather than sorted into collections, invisible to
+    get_collection_tree entirely.
+
+    Returns one level at a time rather than the whole subtree, since a single
+    parent can have hundreds of children on a rig like that. Omit `name` for
+    the scene's root objects (no parent); pass an object name to expand its
+    immediate children. Each child reports its own child_count so you know
+    whether to drill into it next.
+
+    Parameters:
+    - name: Object to expand. Omit for the scene's parentless root objects.
+    - max_items: Cap on children listed (default 25; 0 for all). The true
+      count is always in total_children even when capped.
+    """
+    result = get_blender_connection().send_command(
+        "get_object_tree", {"name": name, "max_items": max_items})
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 

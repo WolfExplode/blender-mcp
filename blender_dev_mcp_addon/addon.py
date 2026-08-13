@@ -580,6 +580,46 @@ class BlenderDevMCPServer:
             } for o in shown],
         }
 
+    @command("get_object_tree")
+    def get_object_tree(self, name=None, max_items=25):
+        """One level of the Outliner's object-parenting tree - not collections.
+
+        The Outliner nests objects under their parent object (Object.parent),
+        independent of collection membership - mmd_tools is a good example, it
+        parents hundreds of rigidbody/joint empties under helper objects like
+        "rigidbodies" rather than sorting them into collections, so
+        get_collection_tree never sees that structure at all.
+
+        A parent with hundreds of children makes returning the whole subtree
+        expensive and mostly noise, so this returns one level at a time:
+        Omit `name` for the scene's root objects (obj.parent is None); pass an
+        object name to list its immediate children. Each child reports its own
+        child_count, so the caller knows whether to drill further.
+        """
+        if name is None:
+            roots = [o for o in bpy.context.scene.objects if o.parent is None]
+            parent = None
+        else:
+            obj = bpy.data.objects.get(name)
+            if obj is None:
+                raise ValueError(f"Object not found: {name}")
+            roots = list(obj.children)
+            parent = {"name": obj.name, "type": obj.type}
+
+        roots.sort(key=lambda o: o.name)
+        total = len(roots)
+        shown = roots[:max_items] if max_items else roots
+        return {
+            "parent": parent,
+            "total_children": total,
+            "showing": len(shown),
+            "children": [{
+                "name": o.name,
+                "type": o.type,
+                "child_count": len(o.children),
+            } for o in shown],
+        }
+
     @command("get_viewport_screenshot")
     def get_viewport_screenshot(self, max_size=800, filepath=None, format="png"):
         """Render the 3D viewport to `filepath`.
