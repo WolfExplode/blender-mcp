@@ -795,6 +795,67 @@ class BlenderDevMCPServer:
             } for o in shown],
         }
 
+    @command("get_bone_tree")
+    def get_bone_tree(self, object_name, name=None, max_items=25):
+        """One level of an armature's bone-parenting tree - get_object_tree's
+        contract, applied to Bone.parent/children instead of Object.parent.
+
+        get_object_tree exists because a parent object with hundreds of
+        children makes returning the whole subtree expensive and mostly
+        noise; an armature has the exact same shape problem one level down -
+        an mmd_tools physics rig can carry 300+ bones, and audit_names or a
+        plain bone-name list flattens that hierarchy away entirely, which is
+        precisely the thing worth checking after a bulk bone rename (does
+        "Elbow Aux.R" still parent under "Arm.R" the way "ひじ補助.R" did
+        under "腕.R"). This is that check, without hand-walking
+        Bone.parent/Bone.children in execute_blender_code.
+
+        Returns one level at a time rather than the whole subtree, same
+        reasoning as get_object_tree. Omit `name` for the armature's root
+        bones (bone.parent is None); pass a bone name to expand its
+        immediate children. Each child reports its own child_count so you
+        know whether to drill into it next.
+
+        Parameters:
+        - object_name: The armature object whose bones to walk. (Not the
+          armature *datablock* - the same object name get_object_info or
+          rename's bone kind would take.)
+        - name: Bone to expand. Omit for the armature's parentless root bones.
+        - max_items: Cap on children listed (default 25; 0 for all). The
+          true count is always in total_children even when capped.
+        """
+        obj = self._resolve_name(bpy.data.objects, object_name, "Object")
+        if obj.type != 'ARMATURE':
+            raise ValueError(
+                f"{object_name!r} is a {obj.type} object, not an Armature - "
+                "bones live on the armature that deforms a mesh, not on the "
+                "mesh itself")
+        bones = obj.data.bones
+
+        if name is None:
+            roots = [b for b in bones if b.parent is None]
+            parent = None
+        else:
+            bone = bones.get(name)
+            if bone is None:
+                raise ValueError(f"No bone named {name!r} on {object_name!r}")
+            roots = list(bone.children)
+            parent = {"name": bone.name}
+
+        roots.sort(key=lambda b: b.name)
+        total = len(roots)
+        shown = roots[:max_items] if max_items else roots
+        return {
+            "armature": obj.name,
+            "parent": parent,
+            "total_children": total,
+            "showing": len(shown),
+            "children": [{
+                "name": b.name,
+                "child_count": len(b.children),
+            } for b in shown],
+        }
+
     @command("get_viewport_screenshot")
     def get_viewport_screenshot(self, max_size=800, filepath=None, format="png"):
         """Render the 3D viewport to `filepath`.
@@ -1442,9 +1503,24 @@ class BlenderDevMCPServer:
             result["undo_budget"] = undo.budget()
         return result
 
+    @staticmethod
+    def _audit_entry(names, max_items):
+        """{"count", "names", "omitted"?} for one audit_names kind - shared by
+        the whole-file scan and the single-kind scan so their report shape
+        can't drift apart.
+        """
+        entry = {"count": len(names)}
+        if max_items and len(names) > max_items:
+            entry["names"] = names[:max_items]
+            entry["omitted"] = len(names) - max_items
+        else:
+            entry["names"] = names
+        return entry
+
     @command("audit_names")
-    def audit_names(self, pattern=None, max_items=50):
-        """Scan every named thing in the watched namespace for a leftover, without changing anything.
+    def audit_names(self, pattern=None, max_items=50, kind=None, object_name=None):
+        """Scan names for a leftover, without changing anything - the whole
+        watched namespace by default, or one specific collection.
 
         Exists to close a gap `rename` and its `substitutions` mode leave
         open: after a bulk rewording pass, "did it actually get everything"
@@ -1455,23 +1531,52 @@ class BlenderDevMCPServer:
         loop was written from scratch twice in one translation job. This
         command is that loop, kept once, here.
 
-        It reuses `state.fingerprint()` rather than re-deriving which
-        collections to look in - the exact same namespace `rename` and
-        `execute_blender_code`'s dry_run diff already watch (objects, meshes,
-        materials, armatures, actions, images, collections, node_groups,
-        shape_keys, curves, cameras, lights, textures, worlds, texts, scenes,
-        plus bones/vertex_groups/shape_keys.key_blocks). A name this command
-        cannot see is, by construction, a name a dry_run diff could not have
-        reported as renamed either - the two share one definition of "every
-        named thing that matters" on purpose.
+        With `kind` omitted, it reuses `state.fingerprint()` rather than
+        re-deriving which collections to look in - the exact same namespace
+        `rename` and `execute_blender_code`'s dry_run diff already watch
+        (objects, meshes, materials, armatures, actions, images, collections,
+        node_groups, shape_keys, curves, cameras, lights, textures, worlds,
+        texts, scenes, plus bones/vertex_groups/shape_keys.key_blocks). A
+        name this command cannot see is, by construction, a name a dry_run
+        diff could not have reported as renamed either - the two share one
+        definition of "every named thing that matters" on purpose.
+
+        With `kind` given, it instead looks in exactly one collection - the
+        same one `rename` would target with that kind/object_name pair,
+        found via the same `_rename_collection` lookup, so the two commands
+        can't disagree about what a kind means or where it lives. This is
+        also how to *enumerate* a collection rather than filter it: pass
+        pattern="" (an explicit empty string, not omitted) and every name
+        matches, since every string contains "". Omitting pattern still
+        means "non-ASCII", the same as the whole-file scan - the distinction
+        is None (default predicate) vs "" (match-everything) vs a real
+        string (that substring), not truthiness, precisely so an empty
+        pattern can mean "list everything" instead of collapsing into the
+        default.
 
         Parameters:
-        - pattern: A literal substring to search for. Omit it and the default
-          predicate is "contains a non-ASCII character" - the leftover-CJK
-          check this exists for. Pass one to check something narrower after a
-          partial fix - e.g. "首" to confirm no bone, object or material
-          still contains the character a substitutions dict was meant to
-          have replaced everywhere.
+        - pattern: A literal substring to search for. Omit it (leave as
+          None) for the default predicate, "contains a non-ASCII character"
+          - the leftover-CJK check this exists for. Pass "" to match every
+          name regardless of content - the enumeration case, only useful
+          together with `kind` since the whole-file scan would otherwise
+          return the entire fingerprint. Pass a real string to check
+          something narrower after a partial fix - e.g. "首" to confirm no
+          bone, object or material still contains a character a
+          substitutions dict was meant to have replaced everywhere.
+        - kind: Restrict the scan to one collection instead of the whole
+          watched namespace - the same vocabulary as `rename`'s `kind`: a
+          bpy.data collection ("object", "mesh", "material", "armature",
+          ...) or one of the three contextual kinds ("bone", "vertex_group",
+          "shape_key") that need `object_name`. The report's one entry is
+          keyed by this string rather than by state.py's collection name
+          (e.g. "bone", not "bones") - a reminder that a scoped call and a
+          whole-file call are answering different questions and their keys
+          aren't meant to be merged.
+        - object_name: Required with kind="bone"/"vertex_group"/"shape_key",
+          same meaning as in `rename` - the armature or mesh that owns them.
+          Not meaningful without `kind` (there is no single object to scope
+          a whole-file scan to), and an error to pass otherwise.
         - max_items: Cap on names listed per kind (default 50, 0 for all).
           Full counts are always in "count" per kind and "total_matches"
           overall, regardless of the cap - see execute_blender_code's
@@ -1481,22 +1586,31 @@ class BlenderDevMCPServer:
         "total_matches": N}. A kind with no matches is left out entirely
         rather than reported as zero, same reasoning as `state.diff`.
         """
-        predicate = (lambda name: pattern in name) if pattern else (lambda name: not name.isascii())
-        snapshot = state.fingerprint()
+        if object_name is not None and kind is None:
+            raise ValueError(
+                "object_name needs kind - it scopes which object's "
+                "bone/vertex_group/shape_key collection to look in, and "
+                "means nothing against a whole-file scan")
 
+        predicate = (lambda name: pattern in name) if pattern is not None \
+            else (lambda name: not name.isascii())
+
+        if kind is not None:
+            collection = self._rename_collection(kind, object_name)
+            names = sorted({item.name for item in collection if predicate(item.name)})
+            if not names:
+                return {"matched": {}, "total_matches": 0}
+            return {"matched": {kind: self._audit_entry(names, max_items)},
+                    "total_matches": len(names)}
+
+        snapshot = state.fingerprint()
         matched, total = {}, 0
-        for kind, items in snapshot.items():
+        for snap_kind, items in snapshot.items():
             names = sorted({name for name in items.values() if predicate(name)})
             if not names:
                 continue
             total += len(names)
-            entry = {"count": len(names)}
-            if max_items and len(names) > max_items:
-                entry["names"] = names[:max_items]
-                entry["omitted"] = len(names) - max_items
-            else:
-                entry["names"] = names
-            matched[kind] = entry
+            matched[snap_kind] = self._audit_entry(names, max_items)
 
         return {"matched": matched, "total_matches": total}
 

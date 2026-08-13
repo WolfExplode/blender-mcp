@@ -82,6 +82,8 @@ READ_ONLY_COMMANDS = frozenset({
     "get_collection_tree",
     "find_objects",
     "get_object_tree",
+    "get_bone_tree",
+    "audit_names",
 })
 
 
@@ -404,6 +406,36 @@ def get_object_tree(ctx: Context, name: str = None, max_items: int = 25) -> str:
 
 
 @mcp.tool()
+def get_bone_tree(ctx: Context, object_name: str, name: str = None,
+                  max_items: int = 25) -> str:
+    """Read one level of an armature's bone-parenting tree.
+
+    get_object_tree's contract, one level down: Object.parent shows how
+    objects nest, this shows how one armature's own Bone.parent/children
+    nest. A production rig (mmd_tools physics chains especially) can carry
+    300+ bones, and neither audit_names nor a plain bone-name list preserves
+    that hierarchy - both return it flat. This is the tool for "does this
+    bone still parent under the bone it should" after a bulk rename.
+
+    Returns one level at a time rather than the whole subtree, same
+    reasoning as get_object_tree. Omit `name` for the armature's root bones
+    (no parent); pass a bone name to expand its immediate children. Each
+    child reports its own child_count so you know whether to drill further.
+
+    Parameters:
+    - object_name: The armature object whose bones to walk (the object, not
+      the armature datablock - same name get_object_info would take).
+    - name: Bone to expand. Omit for the armature's parentless root bones.
+    - max_items: Cap on children listed (default 25; 0 for all). The true
+      count is always in total_children even when capped.
+    """
+    result = get_blender_connection().send_command(
+        "get_bone_tree",
+        {"object_name": object_name, "name": name, "max_items": max_items})
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
 def get_object_info(ctx: Context, object_name: str, max_items: int = 40) -> str:
     """Inspect one object: transform, mode, selection, materials, modifiers,
     vertex groups, shape keys, mesh counts, and world-space bounding box.
@@ -699,8 +731,10 @@ def rename_items(ctx: Context, kind: str = None, targets: list = None,
 
 
 @mcp.tool()
-def audit_names(ctx: Context, pattern: str = None, max_items: int = 50) -> str:
-    """Scan every named thing in the file for a leftover, without changing anything.
+def audit_names(ctx: Context, pattern: str = None, max_items: int = 50,
+                kind: str = None, object_name: str = None) -> str:
+    """Scan names for a leftover, without changing anything - the whole file
+    by default, or one specific collection.
 
     Use this after a rename_items substitutions pass to confirm it actually
     got everything, instead of hand-writing a scan in execute_blender_code -
@@ -709,20 +743,38 @@ def audit_names(ctx: Context, pattern: str = None, max_items: int = 50) -> str:
     got written from scratch twice during one translation job before this
     tool existed to replace it.
 
-    It looks in the same namespace rename_items and execute_blender_code's
-    dry_run diff watch - objects, meshes, materials, armatures, actions,
-    images, collections, node_groups, shape_keys, curves, cameras, lights,
-    textures, worlds, texts, scenes, plus bones, vertex groups and shape key
-    blocks. A name this misses is a name a dry_run diff could not have
-    reported as renamed either.
+    With kind omitted, it looks in the same namespace rename_items and
+    execute_blender_code's dry_run diff watch - objects, meshes, materials,
+    armatures, actions, images, collections, node_groups, shape_keys, curves,
+    cameras, lights, textures, worlds, texts, scenes, plus bones, vertex
+    groups and shape key blocks. A name this misses is a name a dry_run diff
+    could not have reported as renamed either.
+
+    With kind given, it looks in exactly one collection instead - the same
+    one rename_items would target with that kind/object_name pair. This also
+    doubles as the way to enumerate a collection rather than filter it: pass
+    pattern="" (an explicit empty string) and every name matches, since every
+    string contains "". This is the tool for "list every bone on this
+    armature" or "list every shape key on this mesh" - there is no separate
+    lister, because a filter with an always-true predicate already is one.
 
     Parameters:
-    - pattern: A literal substring to search for. Omit it and the check is
-      "contains a non-ASCII character" - the leftover-CJK-after-translation
-      case this exists for. Pass one to check something narrower after a
-      partial fix, e.g. "首" to confirm no bone, object or material anywhere
-      in the file still contains a character a substitutions pass was
-      supposed to have replaced everywhere.
+    - pattern: A literal substring to search for. Omit it for the default
+      check, "contains a non-ASCII character" - the leftover-CJK-after-
+      translation case this exists for. Pass "" to match every name
+      regardless of content (the enumeration case - pair it with kind, since
+      the whole-file scan would otherwise dump the entire fingerprint). Pass
+      a real string to check something narrower after a partial fix, e.g.
+      "首" to confirm no bone, object or material anywhere still contains a
+      character a substitutions pass was supposed to have replaced
+      everywhere.
+    - kind: Restrict the scan to one collection - the same vocabulary as
+      rename_items' kind: a bpy.data collection ("object", "mesh",
+      "material", "armature", ...) or one of "bone", "vertex_group",
+      "shape_key", which need object_name.
+    - object_name: Required with kind="bone"/"vertex_group"/"shape_key" -
+      the armature or mesh that owns them, same meaning as in rename_items.
+      Not meaningful without kind.
     - max_items: Cap on names listed per kind (default 50, 0 for all). Full
       counts are always in "count" per kind and total_matches regardless of
       the cap.
@@ -731,12 +783,20 @@ def audit_names(ctx: Context, pattern: str = None, max_items: int = 50) -> str:
     listed as zero.
     """
     result = get_blender_connection().send_command(
-        "audit_names", {"pattern": pattern, "max_items": max_items})
+        "audit_names", {"pattern": pattern, "max_items": max_items,
+                        "kind": kind, "object_name": object_name})
 
     total = result.get("total_matches", 0)
     if not total:
-        described = f'containing "{pattern}"' if pattern else "with a non-ASCII character"
-        return f"No names {described} found."
+        if pattern:
+            described = f'containing "{pattern}"'
+        elif pattern == "":
+            described = "at all"
+        else:
+            described = "with a non-ASCII character"
+        scoped = f" in {kind} {object_name!r}" if kind and object_name else \
+                 f" among {kind}s" if kind else ""
+        return f"No names {described} found{scoped}."
 
     return json.dumps(result, indent=2, ensure_ascii=False)
 
