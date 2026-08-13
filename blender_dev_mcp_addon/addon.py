@@ -543,18 +543,37 @@ class BlenderDevMCPServer:
         Collection.all_objects, which is recursive into sub-collections - a
         collection can't nest into itself, so no cycle guard is needed. Every
         other filter is a plain AND over the candidate set.
+
+        With every filter omitted, guessing "everything" is rarely useful on a
+        large file, so the pool narrows itself: the current selection if
+        anything is selected, else what's visible in the viewport, else
+        (nothing selected or visible - an empty or fully-hidden scene) every
+        object. `scope` in the result says which of the three was used, so a
+        caller relying on the fallback can tell selected from visible from all.
         """
         if collection:
             coll = bpy.data.collections.get(collection)
             if coll is None:
                 raise ValueError(f"Collection not found: {collection}")
-            candidates = coll.all_objects
+            pool = coll.all_objects
         else:
-            candidates = bpy.context.scene.objects
+            pool = bpy.context.scene.objects
+
+        scope = "all"
+        no_filters = not (name_contains or type or collection
+                          or visible_only or selected_only)
+        if no_filters:
+            selected = [o for o in pool if o.select_get()]
+            if selected:
+                pool, scope = selected, "selected"
+            else:
+                visible = [o for o in pool if o.visible_get()]
+                if visible:
+                    pool, scope = visible, "visible"
 
         needle = name_contains.lower() if name_contains else None
         matches = []
-        for obj in candidates:
+        for obj in pool:
             if type and obj.type != type:
                 continue
             if needle and needle not in obj.name.lower():
@@ -568,6 +587,7 @@ class BlenderDevMCPServer:
         total = len(matches)
         shown = matches[:max_results] if max_results else matches
         return {
+            "scope": scope,
             "total_matches": total,
             "showing": len(shown),
             "objects": [{

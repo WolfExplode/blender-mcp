@@ -348,6 +348,13 @@ def find_objects(ctx: Context, name_contains: str = None, type: str = None,
     order, so it finds a needle in a 668-object file instead of getting lucky.
     Every filter given must match (AND, not OR); omit ones you don't need.
 
+    Call it with no filters first - it does not dump "everything" in scene
+    order. It tries the current selection, then what's visible in the
+    viewport, then falls back to every object only if both of those are
+    empty. The result's `scope` field says which one it used ("selected",
+    "visible", or "all"), so build up from there: whatever the user is
+    already looking at is usually the right starting point on a large file.
+
     Parameters:
     - name_contains: Case-insensitive substring match against the object name
     - type: Exact object type - 'MESH', 'ARMATURE', 'EMPTY', 'CAMERA', etc.
