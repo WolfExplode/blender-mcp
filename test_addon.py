@@ -999,6 +999,45 @@ def _drop_tree(name):
         bpy.data.node_groups.remove(tree)
 
 
+def test_labelled_write_reports_its_diff_without_dry_run(m):
+    """A real write is fingerprinted too, not only a preview.
+
+    The blast radius of an edit - what it created, deleted or renamed - is
+    reported every time something is actually labelled and kept, so a caller
+    never has to run a snippet twice (once to preview, once to keep) just to
+    see what it touched.
+    """
+    tree = _undo_baseline(m, "__real_write__")
+    try:
+        result = m.BlenderDevMCPServer().execute_code(
+            "bpy.data.node_groups['__real_write__'].nodes.new('ShaderNodeMath')",
+            undo_label="add a math node")
+        assert "dry_run" not in result, result
+        assert "reverted" not in result, result
+        # Adding a node inside an existing tree touches no watched datablock
+        # name, so the diff is empty - and the write is real, not undone.
+        assert result["changed"] == {}, result
+        import bpy
+        assert len(bpy.data.node_groups["__real_write__"].nodes) == 2
+    finally:
+        _drop_tree("__real_write__")
+
+
+def test_labelled_write_reports_a_rename_without_dry_run(m):
+    tree = _undo_baseline(m, "__real_rename__")
+    try:
+        result = m.BlenderDevMCPServer().execute_code(
+            "bpy.data.node_groups['__real_rename__'].name = '__real_renamed__'",
+            undo_label="rename tree")
+        renamed = result["changed"]["node_groups"]["renamed"]
+        assert {"from": "__real_rename__", "to": "__real_renamed__"} in renamed, result
+        import bpy
+        assert "__real_renamed__" in bpy.data.node_groups
+    finally:
+        _drop_tree("__real_rename__")
+        _drop_tree("__real_renamed__")
+
+
 def test_labelled_edit_is_revertible(m):
     """The whole point: a labelled write can be taken back in place."""
     import bpy
@@ -1207,7 +1246,7 @@ def test_dry_run_reverts_even_when_the_code_raises(m):
                 dry_run=True)
         except Exception as exc:
             assert "halfway" in str(exc), exc
-            assert "Nothing was kept" in str(exc), exc
+            assert "Nothing in the blend file was kept" in str(exc), exc
             assert "__dry_partial__" in str(exc), \
                 f"the report should say what it had done before failing:\n{exc}"
         else:

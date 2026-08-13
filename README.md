@@ -47,17 +47,24 @@ one general-purpose tool takes arbitrary Python. Three things stand between that
 and a ruined afternoon, all of them built on Blender's own undo stack — and one
 thing that is deliberately *not* here, described at the end of this section.
 
-**`dry_run=True` proposes an edit rather than making one.** Arbitrary Python
-cannot be analysed for what it would do, so the only truthful preview is to run
-it, fingerprint what moved, and undo. What comes back is a diff — what was
-created, deleted and renamed — and the file is as it was. Datablocks are
-identified by address rather than by name, so a bulk rename reports as *renames*
-instead of as N deletions beside N creations.
+**Every labelled write reports what it created, deleted and renamed** — with or
+without `dry_run`. Datablocks are identified by address rather than by name, so
+a bulk rename reports as *renames* instead of N deletions beside N creations.
+The blast radius of an edit is never something to ask for separately.
 
-Two limits, both real: it compares names and existence only, so an edit that
-assigns values shows as no change; and it cannot take back writes that left the
-blend file, so code that saves, exports or deletes on disk is **not** made safe
-by it.
+**`dry_run=True` is for when you might not go through with the edit.** The code
+still runs for real — there is no way to preview arbitrary Python other than
+doing it — but the file is put back afterwards, so nothing in it is kept. Reach
+for it when the scope is the unknown: an operator with implicit reach, a
+wildcard name match, someone else's rig. Skip it when you already know the
+extent from the code — a plain labelled write reports the same diff without a
+second, wasted execution.
+
+Two limits on the diff itself, both real regardless of `dry_run`: it compares
+names and existence only, so an edit that assigns values shows as no change;
+and it cannot take back writes that left the blend file, so code that saves,
+exports or deletes on disk is **not** made safe by it — that already happened
+for real, `dry_run` included.
 
 **A labelled write that raises is rolled back.** A loop that dies on item 200 of
 405 has already applied 199 changes. They used to stay applied with a revert

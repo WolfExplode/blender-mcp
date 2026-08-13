@@ -611,14 +611,22 @@ class BlenderDevMCPServer:
         revert point for every diagnostic print would bury the user's own edit
         history under our noise, and each push copies the whole file.
 
-        Two things make a write here safe to attempt rather than merely
-        recoverable, and both work by running the code and then taking it back:
+        Every labelled call - dry run or not - fingerprints the file before and
+        after, and the result always reports what was created, deleted and
+        renamed. That costs one extra fingerprint on an ordinary write, and it
+        means the blast radius of an edit is never something you have to guess
+        at or ask for separately: a loop that touched 3 objects and one that
+        touched 300 look identical in the code and different in the report.
 
-        `dry_run` previews. Arbitrary Python cannot be analysed for what it
-        would do, so the only truthful preview is to do it, fingerprint what
-        moved, and undo. What comes back is the diff, not a changed file. It
-        needs no `undo_label` and refuses outright if Blender will not accept an
-        undo push, because a preview that cannot be reverted is just an edit.
+        `dry_run` is for when you might not go through with the edit at all.
+        The code still runs for real - there is no way to preview arbitrary
+        Python other than doing it - but the result comes back as a proposal:
+        the diff, with the file already put back the way it was, so nothing is
+        kept if you decide not to proceed. Reach for it before an edit whose
+        scope you cannot read off the code, because the extent is the unknown
+        (an operator with implicit reach, a wildcard match, someone else's
+        rig) - not as a routine first step, since a labelled write reports the
+        same diff without a second, wasted execution.
 
         `rollback_on_error` makes a labelled write atomic. A loop that raises on
         item 200 of 405 has already applied 199 changes, and previously they
@@ -657,7 +665,11 @@ class BlenderDevMCPServer:
                     "push, so the code could not be guaranteed revertible and "
                     "was not run at all. Re-send without dry_run only if you "
                     "mean to keep the change.")
-        if dry_run:
+        # Fingerprinting is what lets any labelled call report its blast
+        # radius, not only a dry run - so this is keyed on `label`, not
+        # `dry_run`. An unlabelled call skips it: nothing here will be kept or
+        # reported, so there is nothing worth diffing.
+        if label:
             before = state.fingerprint()
 
         pushed = False
@@ -672,11 +684,11 @@ class BlenderDevMCPServer:
             # The failure case is the important one: a snippet that died halfway
             # has already changed the file, and without a revert point that
             # partial edit is the one thing that could not be taken back.
-            after = state.fingerprint() if dry_run else None
+            after = state.fingerprint() if label else None
             if label:
                 pushed = undo.push(f"MCP {label}")
 
-        changes = state.diff(before, after) if dry_run else None
+        changes = state.diff(before, after) if label else None
 
         # Give back whatever was just done, if it was never meant to be kept or
         # was abandoned half-finished. Both cases are the same operation.
@@ -699,7 +711,10 @@ class BlenderDevMCPServer:
             # Say what the file looks like now, because "it raised" and "it
             # raised and left 199 renames behind" call for different next moves.
             if dry_run:
-                note = ("Nothing was kept - this was a dry run."
+                note = ("Nothing in the blend file was kept - this was a dry "
+                        "run. Anything the code did outside it (saves, "
+                        "exports, network calls, other files) already "
+                        "happened for real and undo cannot touch it."
                         if reverted else
                         "WARNING: the dry run could not be reverted, so any "
                         "change it made before failing is still applied.")
@@ -716,20 +731,20 @@ class BlenderDevMCPServer:
                 note = ("WARNING: rollback failed, so any partial change is "
                         f"still applied ({revert_error}).")
             detail = ""
-            if dry_run and changes:
+            if changes:
                 detail = ("\n\nIt had already made these changes when it "
                           f"failed:\n{json.dumps(state.summarise(changes, max_diff_items), indent=2, ensure_ascii=False)}")
             raise Exception(f"Code execution error:\n{output}\n{note}{detail}")
 
         result = {"executed": True, "result": output}
+        if label:
+            result.update(state.summarise(changes, max_diff_items))
+            result["undo_budget"] = undo.budget()
         if dry_run:
             result["dry_run"] = True
             result["reverted"] = reverted
             if revert_error:
                 result["revert_error"] = revert_error
-            result.update(state.summarise(changes, max_diff_items))
-        if label:
-            result["undo_budget"] = undo.budget()
         return result
 
     @command("list_node_trees")

@@ -341,7 +341,11 @@ def execute_blender_code(ctx: Context, code: str, undo_label: str = None,
 
     This is the general-purpose tool here, and deliberately so: the read tools
     answer fixed questions, and anything else is a few lines of bpy. Reach for
-    it freely to read; use dry_run before it writes.
+    it freely to read.
+
+    Every labelled write - dry run or not - reports what it created, deleted
+    and renamed, so the blast radius of an edit is always visible rather than
+    something to ask for separately.
 
     Parameters:
     - code: Python source to execute. `bpy`, `bmesh`, `mathutils` and `math`
@@ -351,20 +355,17 @@ def execute_blender_code(ctx: Context, code: str, undo_label: str = None,
       description of the change ("add curve resample", "relink noise input").
       It registers the edit as one step, which makes it a single Ctrl-Z for the
       user and lets undo_edit take it back. Leave it unset for code that only
-      reads - an unlabelled edit cannot be undone through this tooling.
-    - dry_run: Run the code, report what it changed, then put it back. Use this
-      before any bulk write - it is the difference between proposing an edit and
-      making one, and on someone's open unsaved file that difference is the
-      whole game. What comes back is a diff of what was created, deleted and
-      renamed. Three limits: it compares names and existence only, so a pure
-      value assignment shows as no change; it watches bpy.data plus vertex
-      groups, bones and shape keys, so state an addon keeps in its own
-      PropertyGroup collections (mmd_root.vertex_morphs, rig metadata, modifier
-      settings) is invisible - and when an addon binds its records to datablocks
-      *by name*, a rename is exactly the edit whose risky half will not appear;
-      and it cannot take back writes outside the blend file, so code that saves,
-      exports or deletes on disk is NOT made safe by it. Print the post-state
-      yourself for anything the diff cannot see.
+      reads - an unlabelled edit cannot be undone through this tooling, and its
+      diff is not fingerprinted at all.
+    - dry_run: For when you might not go through with the edit. The code still
+      runs for real - there is no way to preview arbitrary Python other than
+      doing it - but the file is put back afterwards, so nothing in it is kept.
+      Reach for this when the scope is the unknown: an operator with implicit
+      reach, a wildcard name match, someone else's rig. Skip it for an edit
+      whose extent you already know from the code - a plain labelled write
+      reports the same diff without a second, wasted execution. It cannot take
+      back writes outside the blend file: a save, export or network call inside
+      dry-run code already happened for real, and undo cannot touch it.
     - rollback_on_error: When labelled code raises partway, take back what it
       already did (default true). Turn it off only to inspect the wreckage of a
       half-applied edit.
@@ -373,6 +374,15 @@ def execute_blender_code(ctx: Context, code: str, undo_label: str = None,
       you get a head-and-tail sample rather than the first N, because the lists
       are name-sorted and the unexpected entry is as likely to sort last as
       first. The full counts are always reported under "totals".
+
+    The diff has its own blind spots regardless of dry_run: it compares names
+    and existence only, so a pure value assignment shows as no change; and it
+    watches bpy.data plus vertex groups, bones and shape keys, so state an
+    addon keeps in its own PropertyGroup collections (mmd_root.vertex_morphs,
+    rig metadata, modifier settings) is invisible - and when an addon binds its
+    records to datablocks *by name*, a rename is exactly the edit whose risky
+    half will not appear. Print the post-state yourself for anything the diff
+    cannot see.
     """
     result = get_blender_connection().send_command(
         "execute_code", {"code": code, "undo_label": undo_label,
@@ -381,13 +391,22 @@ def execute_blender_code(ctx: Context, code: str, undo_label: str = None,
                          "max_diff_items": max_diff_items})
 
     output = result.get("result", "") or "(no output)"
-    if not result.get("dry_run"):
+    # Only a labelled call (dry run or a real write) is fingerprinted, so only
+    # those get a diff report - an unlabelled read-only call returns just its
+    # printed output.
+    if "changed" not in result:
         return output
 
+    if result.get("dry_run"):
+        header = ("[dry run - nothing in the blend file was kept]"
+                  if result.get("reverted") else
+                  "[dry run - WARNING: could not be reverted, the change is "
+                  f"still applied: {result.get('revert_error')}]")
+    else:
+        header = "[written and undo-pushed]"
+    report = [header]
+
     changed = result.get("changed") or {}
-    report = ["[dry run - nothing was kept]" if result.get("reverted")
-              else "[dry run - WARNING: could not be reverted, the change is "
-                   f"still applied: {result.get('revert_error')}]"]
     if changed:
         report.append(json.dumps({"changed": changed,
                                   "totals": result.get("totals", {})},
@@ -396,7 +415,7 @@ def execute_blender_code(ctx: Context, code: str, undo_label: str = None,
         report.append(
             "No datablock was created, deleted or renamed. If the code was "
             "meant to assign values rather than rename things, that is expected "
-            "- a dry run cannot see it. Verify by reading the values back.")
+            "- this diff cannot see it. Verify by reading the values back.")
     if output != "(no output)":
         report.append("--- output ---")
         report.append(output)
