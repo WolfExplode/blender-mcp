@@ -481,10 +481,13 @@ def execute_blender_code(ctx: Context, code: str, undo_label: str = None,
       file (saves, exports, network calls already happened for real).
     - rollback_on_error: When labelled code raises partway, take back what it
       already did (default true). False keeps the wreckage for inspection.
-    - max_diff_items: Cap per change kind (default 100, 0 = no cap). Past the
-      cap you get a head-and-tail sample, not the first N, since lists are
-      name-sorted and an outlier is as likely to sort last as first. Full
-      counts always in "totals".
+    - max_diff_items: Cap per change kind (default 100, 0 = no cap, negative =
+      totals only with no item list at all). Past the cap you get a
+      head-and-tail sample, not the first N, since lists are name-sorted and
+      an outlier is as likely to sort last as first. Full counts always in
+      "totals" regardless of the cap - reach for negative on an edit spanning
+      several kinds at hundreds of items each, where even the sampled lists
+      can add up to more than the caller's own output budget.
 
     Diff blind spots regardless of dry_run: compares names/existence only, so
     a value assignment shows as no change; only watches bpy.data plus vertex
@@ -543,7 +546,9 @@ def execute_blender_code(ctx: Context, code: str, undo_label: str = None,
 
 
 @mcp.tool()
-def rename_items(ctx: Context, kind: str, renames: dict, object_name: str = None,
+def rename_items(ctx: Context, kind: str = None, targets: list = None,
+                 renames: dict = None, substitutions: dict = None,
+                 pattern_order: str = "longest_first", object_name: str = None,
                  dry_run: bool = False, undo_label: str = None,
                  max_diff_items: int = 100) -> str:
     """Rename a batch of same-kind items and report every knock-on change.
@@ -565,24 +570,84 @@ def rename_items(ctx: Context, kind: str, renames: dict, object_name: str = None
     changed, not what the loop believed it did.
 
     Parameters:
-    - kind: What's being renamed. A bpy.data collection - "object", "mesh",
-      "material", "armature", "action", "image", "collection", "node_group",
-      "curve", "camera", "light", "texture", "world", "text", "scene" - or one
-      of the three cascading sub-item kinds - "bone", "vertex_group",
-      "shape_key" - which need object_name.
+    - kind: What's being renamed, for a single target. A bpy.data collection
+      - "object", "mesh", "material", "armature", "action", "image",
+      "collection", "node_group", "curve", "camera", "light", "texture",
+      "world", "text", "scene" - or one of the three cascading sub-item
+      kinds - "bone", "vertex_group", "shape_key" - which need object_name.
+      Exactly one of kind or targets is required.
+    - targets: [{"kind": ..., "object_name": ...}, ...] - rename across
+      several kinds in one call instead of one rename_items call per kind,
+      all sharing the one renames/substitutions given here, applied as one
+      undo step with one before/after diff. Built for exactly the case that
+      motivated substitutions in the first place: translating or rewording
+      every object, mesh, material, armature, bone and shape key name in a
+      file is naturally one dict applied across six-odd kinds, and that used
+      to mean six-odd separate calls. object_name inside a target dict means
+      what it means in the single-target form (only for the three
+      contextual kinds); omit it for bpy.data kinds. A pattern that only
+      applies to one target's kind (a hair-color term, say, in a target
+      whose kind is "armature") simply matches nothing there at no cost -
+      unused_patterns only flags a pattern that matched nothing across
+      *every* target, not per target.
+
+      Don't add a "vertex_group" target next to a "bone" target covering the
+      same rig with the same renames/substitutions - the bone rename already
+      cascades to the matching vertex groups within this same call, so by
+      the time a vertex_group target ran those names would already be gone.
+      Every one would come back "missing", harmlessly, but it's a wasted
+      target. Leave vertex_group out and let the cascade do it.
+
+      A failure partway through the list rolls back every target already
+      applied in that call, not only the one that raised.
     - renames: {old_name: new_name}. A name missing from the collection is
       reported rather than raising, so one typo in a batch of 400 doesn't cost
-      the rest.
-    - object_name: Required for bone/vertex_group/shape_key - the armature
-      (for bone) or mesh (for vertex_group/shape_key) that owns them. Ignored
-      for bpy.data kinds.
+      the rest. Exactly one of renames or substitutions is required.
+    - substitutions: {pattern: replacement} - for renaming by rule instead of
+      by an explicit list of names, e.g. translating every Japanese/Chinese
+      bone, object and material name in a file to English in one call per
+      kind. Every current name in the collection is read live and each
+      pattern is applied to it in turn via plain substring replace; a name
+      nothing matches is left alone. Any pattern that matched nothing at all
+      comes back under "unused_patterns" - the substitutions equivalent of
+      "missing" for renames, so a mistyped character in one entry out of a
+      hundred doesn't have to be found by re-reading the whole result by eye.
+    - pattern_order: "longest_first" (default) or "given". Substring patterns
+      are inherently order-dependent: if one pattern's text is itself a
+      substring of another's ("首"->"Neck" and "手首"->"Wrist"), whichever
+      fires first consumes the shared characters and the other can never
+      match as intended - dict order turned "手首" into "手Neck" instead of
+      "Wrist" this way during this feature's own development, twice, once
+      from raw ordering and once from trimming a dict down to a subset and
+      losing a fallback pattern upstream entries had been depending on.
+      "longest_first" removes that whole class of mistake for the common
+      case (a translation/rewording glossary, where the longer pattern is
+      essentially always the more specific one) by resolving the longest
+      pattern touching a span first regardless of how the dict was written;
+      equal-length patterns keep dict order as a tiebreak. Pass "given" only
+      for the deliberate, rarer case of a true substitution chain, where one
+      pattern's replacement text is meant to feed what a later, shorter
+      pattern matches - forcing longest-first would break that chain.
+    - object_name: With kind (single-target form): required for
+      bone/vertex_group/shape_key - the armature (for bone) or mesh (for
+      vertex_group/shape_key) that owns them. Ignored for bpy.data kinds.
+      Not used with targets - put object_name inside each target dict.
     - dry_run: Apply for real, report the diff, then revert. Reach for this
       when the cascade radius of a rename isn't already known - a bone rename
       on a rig you didn't build, a vertex group shared across meshes you
-      haven't all inspected.
-    - undo_label: Defaults to "rename N <kind>(s)".
-    - max_diff_items: Cap per change kind (default 100, 0 = no cap); see
-      execute_blender_code.
+      haven't all inspected - and always with substitutions, to check pattern
+      ordering before it's kept. With targets, the whole list is applied and
+      reverted together, so the diff is the combined effect of every target,
+      cascades between them included, not one target at a time.
+    - undo_label: Defaults to "rename N <kind>(s)" for a single target,
+      "rename across N target(s)" for targets.
+    - max_diff_items: Cap per change kind (default 100, 0 = no cap, negative =
+      totals only, no item list); see execute_blender_code. A substitutions
+      rename spanning several kinds at once (objects, bones, materials, shape
+      keys...) each with hundreds of items is exactly the case where even a
+      head-and-tail sample per kind adds up to more than a caller's own
+      output budget - drop to a negative max_diff_items and, if a particular
+      name needs checking, look it up with a targeted read afterwards.
 
     A rename can also collide: two old names mapping to the same new one, or a
     new name already taken in that collection. Blender resolves this itself by
@@ -590,11 +655,18 @@ def rename_items(ctx: Context, kind: str, renames: dict, object_name: str = None
     actual result differs from what was requested comes back under
     "collisions" in the report, not silently buried inside the diff as if it
     were the plain rename that was asked for.
+
+    With targets, "missing" and "collisions" entries are tagged with which
+    target (kind, object_name) they came from, and a per-target breakdown
+    (kind, object_name, requested, applied) is always included - cheap even
+    when every target succeeded cleanly, so there's no extra cost to reading
+    a multi-target result that went exactly as intended.
     """
     result = get_blender_connection().send_command(
-        "rename", {"kind": kind, "renames": renames, "object_name": object_name,
-                   "dry_run": dry_run, "undo_label": undo_label,
-                   "max_diff_items": max_diff_items})
+        "rename", {"kind": kind, "targets": targets, "renames": renames,
+                   "substitutions": substitutions, "pattern_order": pattern_order,
+                   "object_name": object_name, "dry_run": dry_run,
+                   "undo_label": undo_label, "max_diff_items": max_diff_items})
 
     header = f"requested {result.get('requested', 0)}, applied {result.get('applied', 0)}"
     if result.get("dry_run"):
@@ -604,8 +676,14 @@ def rename_items(ctx: Context, kind: str, renames: dict, object_name: str = None
         header += " [written and undo-pushed]"
     report = [header]
 
+    if result.get("targets"):
+        report.append("targets: " + json.dumps(result["targets"], ensure_ascii=False))
     if result.get("missing"):
         report.append(f"missing (not found, skipped): {result['missing']}")
+    if result.get("unused_patterns"):
+        report.append("unused_patterns (matched nothing - check for a typo, or "
+                      "for pattern_order='longest_first' having made a shorter "
+                      f"pattern unreachable): {result['unused_patterns']}")
     if result.get("collisions"):
         report.append("collisions (Blender changed the requested name to "
                       f"avoid a clash): {json.dumps(result['collisions'], ensure_ascii=False)}")
@@ -618,6 +696,49 @@ def rename_items(ctx: Context, kind: str, renames: dict, object_name: str = None
     else:
         report.append("No further datablocks were created, deleted or renamed as a side effect.")
     return "\n".join(report)
+
+
+@mcp.tool()
+def audit_names(ctx: Context, pattern: str = None, max_items: int = 50) -> str:
+    """Scan every named thing in the file for a leftover, without changing anything.
+
+    Use this after a rename_items substitutions pass to confirm it actually
+    got everything, instead of hand-writing a scan in execute_blender_code -
+    a loop over objects, materials, every armature's bones, every mesh's
+    vertex groups and shape keys, checking name.isascii() on each. That loop
+    got written from scratch twice during one translation job before this
+    tool existed to replace it.
+
+    It looks in the same namespace rename_items and execute_blender_code's
+    dry_run diff watch - objects, meshes, materials, armatures, actions,
+    images, collections, node_groups, shape_keys, curves, cameras, lights,
+    textures, worlds, texts, scenes, plus bones, vertex groups and shape key
+    blocks. A name this misses is a name a dry_run diff could not have
+    reported as renamed either.
+
+    Parameters:
+    - pattern: A literal substring to search for. Omit it and the check is
+      "contains a non-ASCII character" - the leftover-CJK-after-translation
+      case this exists for. Pass one to check something narrower after a
+      partial fix, e.g. "首" to confirm no bone, object or material anywhere
+      in the file still contains a character a substitutions pass was
+      supposed to have replaced everywhere.
+    - max_items: Cap on names listed per kind (default 50, 0 for all). Full
+      counts are always in "count" per kind and total_matches regardless of
+      the cap.
+
+    A kind with no matches is left out of the report entirely rather than
+    listed as zero.
+    """
+    result = get_blender_connection().send_command(
+        "audit_names", {"pattern": pattern, "max_items": max_items})
+
+    total = result.get("total_matches", 0)
+    if not total:
+        described = f'containing "{pattern}"' if pattern else "with a non-ASCII character"
+        return f"No names {described} found."
+
+    return json.dumps(result, indent=2, ensure_ascii=False)
 
 
 @mcp.tool()

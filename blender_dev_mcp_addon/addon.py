@@ -1093,8 +1093,35 @@ class BlenderDevMCPServer:
             raise ValueError(f"{object_name!r} has no shape keys")
         return obj.data.shape_keys.key_blocks
 
+    _PATTERN_ORDERS = ("longest_first", "given")
+
+    @staticmethod
+    def _substitution_renames(collection, substitutions, pattern_order):
+        """{old_name: new_name} for every current name a substitutions dict
+        actually changes, plus the set of patterns that matched at least one
+        name - shared by the single-target and multi-target rename paths so
+        they can't drift apart on pattern-ordering behaviour.
+        """
+        ordered = list(substitutions.items())
+        if pattern_order == "longest_first":
+            # sort() is stable, so equal-length patterns keep their relative
+            # dict order as the tiebreak.
+            ordered.sort(key=lambda pair: len(pair[0]), reverse=True)
+        matched = set()
+        renames = {}
+        for item in collection:
+            old = new = item.name
+            for pattern, replacement in ordered:
+                if pattern in new:
+                    new = new.replace(pattern, replacement)
+                    matched.add(pattern)
+            if new != old:
+                renames[old] = new
+        return renames, matched
+
     @command("rename")
-    def rename(self, kind, renames, object_name=None, dry_run=False,
+    def rename(self, kind=None, targets=None, renames=None, substitutions=None,
+              pattern_order="longest_first", object_name=None, dry_run=False,
               undo_label=None, max_diff_items=100):
         """Rename a batch of same-kind items and report every knock-on change.
 
@@ -1117,24 +1144,107 @@ class BlenderDevMCPServer:
         changed rather than what the loop believed it did.
 
         Parameters:
-        - kind: What's being renamed. Either a bpy.data collection - "object",
-          "mesh", "material", "armature", "action", "image", "collection",
-          "node_group", "curve", "camera", "light", "texture", "world",
-          "text", "scene" - or one of the three cascading sub-item kinds -
-          "bone", "vertex_group", "shape_key" - which need object_name.
+        - kind: What's being renamed, for a single target. Either a bpy.data
+          collection - "object", "mesh", "material", "armature", "action",
+          "image", "collection", "node_group", "curve", "camera", "light",
+          "texture", "world", "text", "scene" - or one of the three cascading
+          sub-item kinds - "bone", "vertex_group", "shape_key" - which need
+          object_name. Exactly one of kind or targets must be given.
+        - targets: [{"kind": ..., "object_name": ...}, ...] - multiple
+          targets in one call, one shared renames/substitutions applied to
+          each in turn, one undo step and one before/after diff for the
+          whole batch instead of one per kind. Exists for exactly the case
+          this file's rename command was built around: translating or
+          rewording every object, mesh, material, armature, bone and shape
+          key name in a file is naturally one substitutions dict applied
+          across six-odd kinds, and that was six-odd separate calls before
+          this existed. object_name is only meaningful for the three
+          contextual kinds, same as the single-target form; omit it for
+          bpy.data kinds. A pattern irrelevant to a given target's kind (a
+          hair-color term in the "armature" target of a translation pass)
+          simply matches nothing there and costs nothing - unused_patterns
+          only reports a pattern that matched nothing across *every* target,
+          not per target, so a term that only applies to one kind among
+          several doesn't look like a mistake.
+
+          Do not add a "vertex_group" target alongside a "bone" target
+          covering the same rig with the same renames/substitutions: bone
+          renames cascade to the matching vertex group automatically within
+          this same call (see below), so by the time a vertex_group target
+          ran, those names would already be gone - every one of them would
+          report as "missing", harmlessly, but it's dead weight in the call.
+          Leave vertex_group out and let the cascade do it, the same as a
+          single-target bone rename already does.
+
+          A failure partway through a target list rolls back every target
+          already applied in this call, not just the one that raised - the
+          undo boundary spans the whole list, the same as a single target's
+          own atomicity, just wider.
         - renames: {old_name: new_name}. Every old_name is looked up in the
           same pass; a name missing from the collection is reported rather
           than raising, so one typo in a batch of 400 doesn't cost the rest.
-        - object_name: Required for bone/vertex_group/shape_key - the
-          armature (for bone) or mesh (for vertex_group/shape_key) that owns
-          them. Ignored for bpy.data kinds.
+          Exactly one of renames or substitutions must be given.
+        - substitutions: {pattern: replacement}. Alternative to renames for
+          the "translate/reword everything in this collection" case, where
+          the edit is a rule applied across every current name rather than a
+          list of names already known ahead of time - the collection is read
+          live, each pattern is applied via a plain substring `str.replace`,
+          and any item whose name changed becomes one entry of an ordinary
+          rename. Items no pattern touches are left alone, not renamed to
+          themselves.
+
+          Application order is NOT dict order by default - see pattern_order.
+          A pattern that never matched anything (typo, wrong character, or
+          one that pattern_order="longest_first" made unreachable) is listed
+          back under "unused_patterns" rather than failing silently, on the
+          same reasoning as "missing" for renames: a typo in one entry out of
+          a hundred shouldn't have to be found by re-reading the whole file
+          afterwards.
+        - pattern_order: "longest_first" (default) or "given". Substring
+          patterns are order-dependent - if one pattern's text is itself a
+          substring of another's (say "首"->"Neck" and "手首"->"Wrist"), then
+          whichever fires first consumes the shared characters and the other
+          can never match as intended. In dict/insertion order this is a
+          silent trap: it happened twice in one session building the
+          translation table this feature exists for, once by ordering
+          "首" before "手首" (turning "手首" into "手Neck" instead of
+          "Wrist"), and again by trimming a large dict down to a per-kind
+          subset and losing a generic fallback the more specific patterns
+          upstream of it had been relying on. "longest_first" removes the
+          whole class of mistake for the common case (a translation or
+          rewording glossary, where a longer pattern is essentially always
+          the more specific one) by always resolving the longest pattern
+          touching a given span first, regardless of the order the dict was
+          written in - ties (equal-length patterns) fall back to dict order.
+          Pass "given" only for the deliberate, rarer case where an earlier
+          pattern's *replacement* text is meant to feed what a later,
+          shorter pattern matches - true chained substitution, where forcing
+          longest-first would break the intended chain. Even then, dry_run
+          plus reading the diff is the way to confirm the chain actually did
+          what was intended, the same as any other rename.
+        - object_name: With kind (single-target form): required for
+          bone/vertex_group/shape_key - the armature (for bone) or mesh (for
+          vertex_group/shape_key) that owns them. Ignored for bpy.data
+          kinds. Not used with targets - put object_name inside each target
+          dict instead.
         - dry_run: Apply for real, report the diff, then revert - see
           execute_blender_code's dry_run for why this is the only way to
-          preview a rename whose cascade radius isn't already known.
-        - undo_label: Defaults to "rename N <kind>(s)"; renaming always
-          writes; there's no read-only case where a label can be skipped.
-        - max_diff_items: Cap per change kind (default 100, 0 = no cap), see
-          execute_blender_code.
+          preview a rename whose cascade radius isn't already known. With
+          substitutions this also doubles as the way to sanity-check pattern
+          ordering before committing to it. With targets, the whole list is
+          applied and reverted together, so the diff shows the combined
+          effect - cascades across targets included - not one target at a
+          time.
+        - undo_label: Defaults to "rename N <kind>(s)" for a single target,
+          "rename across N target(s)" for targets; renaming always writes;
+          there's no read-only case where a label can be skipped.
+        - max_diff_items: Cap per change kind (default 100, 0 = no cap,
+          negative = totals only with no item list at all - see
+          execute_blender_code and state.summarise). A substitutions rename
+          across several kinds and several hundred items is exactly the case
+          where even the head-and-tail sample gets wide enough to be worth
+          dropping to totals-only and following up with a narrower,
+          per-kind call if a specific name needs checking.
 
         A requested rename can also collide: two old names that map to the
         same new one, or a new name already taken in that collection. Blender
@@ -1142,8 +1252,40 @@ class BlenderDevMCPServer:
         would silently produce a name nobody asked for - so every applied
         rename whose actual resulting name differs from what was requested is
         reported under "collisions", not buried in the diff as a plain rename.
+
+        With targets the report shape differs slightly to stay readable at
+        scale: "targets" is a compact per-target list of
+        {kind, object_name, requested, applied} (always present, cheap even
+        when everything succeeded); "missing" and "collisions" are flat
+        lists tagged with which target they came from, present only if
+        non-empty - a clean multi-target run costs nothing extra to read.
+        "requested"/"applied" at the top level are totals across every
+        target, same keys as the single-target form.
         """
+        if (kind is None) == (targets is None):
+            raise ValueError(
+                "Pass exactly one of kind (a single target) or targets (a "
+                "list of {kind, object_name} dicts sharing one "
+                f"renames/substitutions) (got kind={kind!r}, targets={targets!r})")
+        if (renames is None) == (substitutions is None):
+            raise ValueError(
+                "Pass exactly one of renames or substitutions "
+                f"(got renames={renames!r}, substitutions={substitutions!r})")
+        if pattern_order not in self._PATTERN_ORDERS:
+            raise ValueError(
+                f"pattern_order must be one of {self._PATTERN_ORDERS}, "
+                f"got {pattern_order!r}")
+
+        if targets is not None:
+            return self._rename_multi(targets, renames, substitutions, pattern_order,
+                                      dry_run, undo_label, max_diff_items)
+
         collection = self._rename_collection(kind, object_name)
+
+        unused_patterns = None
+        if substitutions is not None:
+            renames, matched = self._substitution_renames(collection, substitutions, pattern_order)
+            unused_patterns = sorted(set(substitutions) - matched)
 
         label = undo_label or f"rename {len(renames)} {kind}(s)"
         boundary = undo.push(f"before MCP {label}", counts=False)
@@ -1191,6 +1333,8 @@ class BlenderDevMCPServer:
         result = {"requested": len(renames), "applied": len(applied), "missing": missing}
         if collisions:
             result["collisions"] = collisions
+        if unused_patterns:
+            result["unused_patterns"] = unused_patterns
         result.update(state.summarise(changes, max_diff_items))
         if dry_run:
             result["dry_run"] = True
@@ -1198,6 +1342,163 @@ class BlenderDevMCPServer:
         else:
             result["undo_budget"] = undo.budget()
         return result
+
+    def _rename_multi(self, targets, renames, substitutions, pattern_order,
+                      dry_run, undo_label, max_diff_items):
+        """The targets= path of `rename` - see its docstring for the contract.
+
+        Resolves every target's collection up front, so a bad kind or a
+        missing object_name on target 4 of 6 raises before anything is
+        touched rather than after target 3 already wrote. One undo boundary
+        and one before/after fingerprint span the whole list, the same
+        atomicity a single target gets, just wider - a failure partway
+        through rolls back every target already applied in this call.
+        """
+        resolved = []
+        for i, target in enumerate(targets):
+            if not isinstance(target, dict) or "kind" not in target:
+                raise ValueError(
+                    f"targets[{i}] must be a dict with a 'kind' key, got {target!r}")
+            resolved.append((
+                target["kind"], target.get("object_name"),
+                self._rename_collection(target["kind"], target.get("object_name"))))
+
+        label = undo_label or f"rename across {len(resolved)} target(s)"
+        boundary = undo.push(f"before MCP {label}", counts=False)
+        if dry_run and not boundary:
+            raise Exception(
+                "Cannot dry-run here: Blender would not accept an undo push, "
+                "so the change could not be guaranteed revertible and was "
+                "not made at all. Re-send without dry_run only if you mean "
+                "to keep it.")
+
+        before = state.fingerprint()
+        target_reports = []
+        total_requested = total_applied = 0
+        missing, collisions = [], []
+        matched_patterns = set()
+        try:
+            for kind, object_name, collection in resolved:
+                if substitutions is not None:
+                    this_renames, matched = self._substitution_renames(
+                        collection, substitutions, pattern_order)
+                    matched_patterns |= matched
+                else:
+                    this_renames = renames
+
+                target_applied = []
+                for old, new in this_renames.items():
+                    item = collection.get(old)
+                    if item is None:
+                        missing.append({"kind": kind, "object_name": object_name, "name": old})
+                        continue
+                    item.name = new
+                    target_applied.append(old)
+                    if item.name != new:
+                        collisions.append({"kind": kind, "object_name": object_name,
+                                           "requested_from": old, "requested_to": new,
+                                           "actual": item.name})
+                target_reports.append({"kind": kind, "object_name": object_name,
+                                       "requested": len(this_renames),
+                                       "applied": len(target_applied)})
+                total_requested += len(this_renames)
+                total_applied += len(target_applied)
+        except Exception:
+            after = state.fingerprint()
+            pushed = undo.push(f"MCP {label}")
+            changes = state.diff(before, after)
+            if pushed:
+                undo.undo(1)
+            raise Exception(
+                f"rename failed after {total_applied} of {total_requested} "
+                f"succeeded across {len(target_reports)} of {len(resolved)} "
+                f"targets; rolled back.\n"
+                f"{json.dumps(state.summarise(changes, max_diff_items), indent=2, ensure_ascii=False)}")
+
+        after = state.fingerprint()
+        pushed = undo.push(f"MCP {label}")
+        changes = state.diff(before, after)
+
+        reverted = False
+        if pushed and dry_run:
+            undo.undo(1)
+            reverted = True
+
+        result = {"targets": target_reports,
+                  "requested": total_requested, "applied": total_applied}
+        if missing:
+            result["missing"] = missing
+        if collisions:
+            result["collisions"] = collisions
+        if substitutions is not None:
+            unused = sorted(set(substitutions) - matched_patterns)
+            if unused:
+                result["unused_patterns"] = unused
+        result.update(state.summarise(changes, max_diff_items))
+        if dry_run:
+            result["dry_run"] = True
+            result["reverted"] = reverted
+        else:
+            result["undo_budget"] = undo.budget()
+        return result
+
+    @command("audit_names")
+    def audit_names(self, pattern=None, max_items=50):
+        """Scan every named thing in the watched namespace for a leftover, without changing anything.
+
+        Exists to close a gap `rename` and its `substitutions` mode leave
+        open: after a bulk rewording pass, "did it actually get everything"
+        was previously answered by hand-writing a scan in
+        `execute_blender_code` - a loop over bpy.data.objects,
+        bpy.data.materials, every armature's bones, every mesh's
+        vertex_groups and shape_keys, checking `name.isascii()` on each. That
+        loop was written from scratch twice in one translation job. This
+        command is that loop, kept once, here.
+
+        It reuses `state.fingerprint()` rather than re-deriving which
+        collections to look in - the exact same namespace `rename` and
+        `execute_blender_code`'s dry_run diff already watch (objects, meshes,
+        materials, armatures, actions, images, collections, node_groups,
+        shape_keys, curves, cameras, lights, textures, worlds, texts, scenes,
+        plus bones/vertex_groups/shape_keys.key_blocks). A name this command
+        cannot see is, by construction, a name a dry_run diff could not have
+        reported as renamed either - the two share one definition of "every
+        named thing that matters" on purpose.
+
+        Parameters:
+        - pattern: A literal substring to search for. Omit it and the default
+          predicate is "contains a non-ASCII character" - the leftover-CJK
+          check this exists for. Pass one to check something narrower after a
+          partial fix - e.g. "首" to confirm no bone, object or material
+          still contains the character a substitutions dict was meant to
+          have replaced everywhere.
+        - max_items: Cap on names listed per kind (default 50, 0 for all).
+          Full counts are always in "count" per kind and "total_matches"
+          overall, regardless of the cap - see execute_blender_code's
+          max_diff_items for why full counts survive truncation.
+
+        Returns {"matched": {kind: {"count", "names", "omitted"?}, ...},
+        "total_matches": N}. A kind with no matches is left out entirely
+        rather than reported as zero, same reasoning as `state.diff`.
+        """
+        predicate = (lambda name: pattern in name) if pattern else (lambda name: not name.isascii())
+        snapshot = state.fingerprint()
+
+        matched, total = {}, 0
+        for kind, items in snapshot.items():
+            names = sorted({name for name in items.values() if predicate(name)})
+            if not names:
+                continue
+            total += len(names)
+            entry = {"count": len(names)}
+            if max_items and len(names) > max_items:
+                entry["names"] = names[:max_items]
+                entry["omitted"] = len(names) - max_items
+            else:
+                entry["names"] = names
+            matched[kind] = entry
+
+        return {"matched": matched, "total_matches": total}
 
     @command("list_node_trees")
     def list_node_trees(self):

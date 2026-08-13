@@ -113,13 +113,24 @@ def summarise(changes, max_items=100):
     whatever sorts last - and an unexpected `zzz_tmp` at the end of the
     alphabet is precisely the entry this function claims to protect. Sampling
     both ends costs nothing and cannot silently hide one extreme.
+
+    max_items < 0 drops every item and keeps only "totals" - for a change
+    spanning several hundred items across several kinds (a whole-file rename),
+    even the head-and-tail sample multiplied across every kind can be wide
+    enough to exceed a caller's own output budget before max_items=0 is ever
+    reached. There is no item list to check by eye at that scale anyway; the
+    counts are the useful signal, and a second labelled call with a narrow
+    max_items (or a targeted read afterwards) covers spot-checking specific
+    names.
     """
     trimmed, totals = {}, {}
     for kind, entry in changes.items():
         out = {}
         for action, items in entry.items():
             totals[f"{kind}.{action}"] = len(items)
-            if max_items and len(items) > max_items:
+            if max_items is not None and max_items < 0:
+                out[f"{action}_omitted"] = len(items)
+            elif max_items and len(items) > max_items:
                 head = -(-max_items // 2)  # ceil, so odd caps favour the head
                 tail = max_items - head
                 out[action] = items[:head] + (items[-tail:] if tail else [])

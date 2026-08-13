@@ -1946,6 +1946,177 @@ def test_rename_contextual_kind_without_object_name_raises(m):
         assert "object_name" in str(exc), exc
 
 
+def test_rename_substitutions_computes_renames_from_patterns(m):
+    tree = _undo_baseline(m, "__rename_sub_prefix_widget__")
+    try:
+        result = m.BlenderDevMCPServer().rename(
+            kind="node_group", substitutions={"prefix_": "renamed_"},
+            undo_label="substitution rename")
+        assert result["applied"] == 1, result
+        renamed = result["changed"]["node_groups"]["renamed"]
+        assert {"from": "__rename_sub_prefix_widget__",
+               "to": "__rename_sub_renamed_widget__"} in renamed, result
+    finally:
+        _drop_tree("__rename_sub_prefix_widget__")
+        _drop_tree("__rename_sub_renamed_widget__")
+
+
+def test_rename_substitutions_leaves_unmatched_names_alone(m):
+    tree = _undo_baseline(m, "__rename_sub_no_match__")
+    try:
+        result = m.BlenderDevMCPServer().rename(
+            kind="node_group", substitutions={"nonexistent_pattern": "x"},
+            undo_label="substitution rename that matches nothing")
+        assert result["applied"] == 0, result
+        assert result["requested"] == 0, result
+        assert result["unused_patterns"] == ["nonexistent_pattern"], result
+        import bpy
+        assert "__rename_sub_no_match__" in bpy.data.node_groups
+    finally:
+        _drop_tree("__rename_sub_no_match__")
+
+
+def test_rename_substitutions_requires_exactly_one_of_renames_or_substitutions(m):
+    for kwargs in ({}, {"renames": {"a": "b"}, "substitutions": {"a": "b"}}):
+        try:
+            m.BlenderDevMCPServer().rename(kind="node_group", **kwargs)
+            assert False, f"expected ValueError for {kwargs}"
+        except ValueError as exc:
+            assert "exactly one of renames or substitutions" in str(exc), exc
+
+
+def test_rename_substitutions_longest_first_is_the_default_and_protects_a_contained_pattern(m):
+    """The exact bug this default exists to prevent: a short pattern ("no")
+    that is a substring of a longer, more specific one ("noodle") would fire
+    first in dict order and consume the characters the specific pattern
+    needed. longest_first resolves "noodle" before "no" regardless of the
+    order the dict was written in, so the specific pattern wins."""
+    tree = _undo_baseline(m, "__rename_sub_noodle_bowl__")
+    try:
+        result = m.BlenderDevMCPServer().rename(
+            kind="node_group",
+            substitutions={"no": "NO_SHORT", "noodle": "PASTA"},
+            undo_label="longest-first protects the specific pattern")
+        assert result["applied"] == 1, result
+        renamed = result["changed"]["node_groups"]["renamed"]
+        assert {"from": "__rename_sub_noodle_bowl__",
+               "to": "__rename_sub_PASTA_bowl__"} in renamed, result
+    finally:
+        _drop_tree("__rename_sub_noodle_bowl__")
+        _drop_tree("__rename_sub_PASTA_bowl__")
+
+
+def test_rename_substitutions_pattern_order_given_respects_dict_order(m):
+    """pattern_order="given" is the deliberate opt-out: with it, the same
+    dict that longest_first would reorder is applied exactly as written, so
+    the short pattern fires first and shadows the longer one - reproducing
+    the historical bug on purpose, to prove the escape hatch actually
+    disables the safety default rather than silently ignoring the request.
+    """
+    tree = _undo_baseline(m, "__rename_sub_noodle_bowl__")
+    try:
+        result = m.BlenderDevMCPServer().rename(
+            kind="node_group", pattern_order="given",
+            substitutions={"no": "NO_SHORT", "noodle": "PASTA"},
+            undo_label="given order lets the short pattern shadow the long one")
+        assert result["applied"] == 1, result
+        renamed = result["changed"]["node_groups"]["renamed"]
+        assert {"from": "__rename_sub_noodle_bowl__",
+               "to": "__rename_sub_NO_SHORTodle_bowl__"} in renamed, result
+        assert result["unused_patterns"] == ["noodle"], result
+    finally:
+        _drop_tree("__rename_sub_noodle_bowl__")
+        _drop_tree("__rename_sub_NO_SHORTodle_bowl__")
+
+
+def test_rename_substitutions_and_pattern_order_reject_unknown_values(m):
+    try:
+        m.BlenderDevMCPServer().rename(
+            kind="node_group", substitutions={"a": "b"}, pattern_order="reverse")
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert "pattern_order" in str(exc), exc
+
+
+def test_rename_targets_applies_shared_substitutions_across_kinds(m):
+    """One substitutions dict, two different bpy.data kinds, one call - the
+    multi-target form this exists for: a translation/rewording pass that
+    would otherwise be one rename_items call per kind.
+    """
+    import bpy
+    tree = _undo_baseline(m, "__rename_targets_prefix_widget__")
+    obj = bpy.data.objects.new("__rename_targets_prefix_thing__", None)
+    bpy.context.scene.collection.objects.link(obj)
+    m.undo.reset()
+    bpy.ops.ed.undo_push(message="baseline for targets rename")
+    try:
+        result = m.BlenderDevMCPServer().rename(
+            targets=[{"kind": "node_group"}, {"kind": "object"}],
+            substitutions={"prefix_": "renamed_"},
+            undo_label="targets rename across two kinds")
+        assert result["requested"] == 2, result
+        assert result["applied"] == 2, result
+        by_kind = {t["kind"]: t for t in result["targets"]}
+        assert by_kind["node_group"] == {"kind": "node_group", "object_name": None,
+                                         "requested": 1, "applied": 1}, result
+        assert by_kind["object"] == {"kind": "object", "object_name": None,
+                                     "requested": 1, "applied": 1}, result
+        assert "__rename_targets_renamed_widget__" in bpy.data.node_groups
+        assert "__rename_targets_renamed_thing__" in bpy.data.objects
+    finally:
+        _drop_tree("__rename_targets_prefix_widget__")
+        _drop_tree("__rename_targets_renamed_widget__")
+        for obj_name in ("__rename_targets_prefix_thing__", "__rename_targets_renamed_thing__"):
+            o = bpy.data.objects.get(obj_name)
+            if o is not None:
+                bpy.data.objects.remove(o)
+
+
+def test_rename_targets_bone_target_cascade_makes_a_vertex_group_target_redundant(m):
+    """Documents the exact interaction the docstring warns about: a
+    vertex_group target covering the same rename as a preceding bone target
+    finds nothing left to do, because the bone target's cascade already beat
+    it there within this same call - and reports that as "missing", not as
+    a failure.
+    """
+    import bpy
+    arm_obj, mesh_obj = _rig_with_vertex_group("__rename_targets_cascade__")
+    m.undo.reset()
+    bpy.ops.ed.undo_push(message="baseline for targets cascade rename")
+    try:
+        result = m.BlenderDevMCPServer().rename(
+            targets=[{"kind": "bone", "object_name": arm_obj.name},
+                    {"kind": "vertex_group", "object_name": mesh_obj.name}],
+            renames={"original": "renamed"},
+            undo_label="targets rename with a redundant vertex_group target")
+        assert mesh_obj.vertex_groups[0].name == "renamed"
+        by_kind = {t["kind"]: t for t in result["targets"]}
+        assert by_kind["bone"]["applied"] == 1, result
+        assert by_kind["vertex_group"]["applied"] == 0, result
+        assert {"kind": "vertex_group", "object_name": mesh_obj.name,
+               "name": "original"} in result["missing"], result
+    finally:
+        _drop_rig("__rename_targets_cascade__")
+
+
+def test_rename_targets_requires_exactly_one_of_kind_or_targets(m):
+    for kwargs in ({"kind": "node_group", "targets": [{"kind": "object"}]}, {}):
+        try:
+            m.BlenderDevMCPServer().rename(renames={"a": "b"}, **kwargs)
+            assert False, f"expected ValueError for {kwargs}"
+        except ValueError as exc:
+            assert "kind" in str(exc) and "targets" in str(exc), exc
+
+
+def test_rename_targets_rejects_a_malformed_target(m):
+    try:
+        m.BlenderDevMCPServer().rename(
+            targets=[{"kind": "object"}, "not_a_dict"], renames={"a": "b"})
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert "targets[1]" in str(exc), exc
+
+
 def test_rename_bone_kind_rejects_non_armature_object(m):
     import bpy
     mesh = bpy.data.meshes.new("__rename_wrong_type_mesh__")
@@ -1960,6 +2131,57 @@ def test_rename_bone_kind_rejects_non_armature_object(m):
     finally:
         bpy.data.objects.remove(obj)
         bpy.data.meshes.remove(mesh)
+
+
+def test_audit_names_finds_non_ascii_names_by_default(m):
+    import bpy
+    obj = bpy.data.objects.new("__audit_non_ascii_首__", None)
+    bpy.context.scene.collection.objects.link(obj)
+    try:
+        result = m.BlenderDevMCPServer().audit_names()
+        assert result["total_matches"] >= 1, result
+        assert obj.name in result["matched"]["objects"]["names"], result
+    finally:
+        bpy.data.objects.remove(obj)
+
+
+def test_audit_names_pattern_searches_a_literal_substring(m):
+    import bpy
+    obj = bpy.data.objects.new("__audit_marker_needle__", None)
+    bpy.context.scene.collection.objects.link(obj)
+    try:
+        found = m.BlenderDevMCPServer().audit_names(pattern="marker_needle")
+        assert found["total_matches"] == 1, found
+        assert found["matched"]["objects"]["names"] == [obj.name], found
+
+        not_found = m.BlenderDevMCPServer().audit_names(pattern="no_such_pattern_anywhere")
+        assert not_found["total_matches"] == 0, not_found
+        assert not_found["matched"] == {}, not_found
+    finally:
+        bpy.data.objects.remove(obj)
+
+
+def test_audit_names_omits_kinds_with_no_matches(m):
+    result = m.BlenderDevMCPServer().audit_names(pattern="no_such_pattern_anywhere_at_all")
+    assert result["matched"] == {}, result
+    assert result["total_matches"] == 0, result
+
+
+def test_audit_names_caps_per_kind_and_reports_the_omitted_count(m):
+    import bpy
+    made = [bpy.data.objects.new(f"__audit_cap_{i}_首__", None) for i in range(3)]
+    for obj in made:
+        bpy.context.scene.collection.objects.link(obj)
+    try:
+        result = m.BlenderDevMCPServer().audit_names(pattern="__audit_cap_", max_items=2)
+        entry = result["matched"]["objects"]
+        assert entry["count"] == 3, entry
+        assert len(entry["names"]) == 2, entry
+        assert entry["omitted"] == 1, entry
+        assert result["total_matches"] == 3, result
+    finally:
+        for obj in made:
+            bpy.data.objects.remove(obj)
 
 
 def main():
