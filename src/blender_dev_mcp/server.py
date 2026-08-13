@@ -1,7 +1,8 @@
 """MCP server exposing a running Blender for addon development and debugging.
 
-Talks to the companion Blender addon over a local socket. Five tools: inspect
-the scene, inspect an object, run Python, grab the viewport, read stderr.
+Talks to the companion Blender addon over a local socket: scene/object/
+collection inspection, object search, arbitrary Python, geometry node
+tooling, viewport and stderr capture.
 
 Forked from blender-mcp by Siddharth Ahuja (github.com/ahujasid) - MIT.
 """
@@ -77,6 +78,8 @@ READ_ONLY_COMMANDS = frozenset({
     "get_node_tree_outline",
     "get_node_detail",
     "validate_node_tree",
+    "get_collection_tree",
+    "find_objects",
 })
 
 
@@ -302,7 +305,9 @@ def get_scene_info(ctx: Context, max_objects: int = 10) -> str:
     """Summarise the current Blender scene.
 
     Returns scene name, object/material counts, current frame, interaction mode,
-    active object, and a truncated object list.
+    active object, and an object list truncated at max_objects in scene order -
+    fine for a small scene, close to useless for finding one object among
+    hundreds. For that, use find_objects or get_collection_tree instead.
 
     Parameters:
     - max_objects: How many objects to list (default 10)
@@ -310,6 +315,56 @@ def get_scene_info(ctx: Context, max_objects: int = 10) -> str:
     result = get_blender_connection().send_command(
         "get_scene_info", {"max_objects": max_objects})
     return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def get_collection_tree(ctx: Context, max_items: int = 20) -> str:
+    """Read the scene's collection hierarchy - the same tree the Outliner shows.
+
+    Cheap and structural, the collection equivalent of get_node_tree_outline:
+    names, nesting, per-collection visibility (excluded from the view layer,
+    hidden in the viewport), and a capped list of the object names directly in
+    each collection (not recursive - a child collection's objects appear under
+    the child, not duplicated in the parent). Use this to see how the user
+    organized the scene before searching it, or to answer "what collections
+    are there" without wading through get_scene_info's object list.
+
+    Parameters:
+    - max_items: Cap on object names listed per collection (default 20; 0 for all)
+    """
+    result = get_blender_connection().send_command(
+        "get_collection_tree", {"max_items": max_items})
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+def find_objects(ctx: Context, name_contains: str = None, type: str = None,
+                 collection: str = None, visible_only: bool = False,
+                 selected_only: bool = False, max_results: int = 50) -> str:
+    """Search for objects instead of paging through get_scene_info's list.
+
+    Filters bpy.context.scene.objects rather than truncating it in scene
+    order, so it finds a needle in a 668-object file instead of getting lucky.
+    Every filter given must match (AND, not OR); omit ones you don't need.
+
+    Parameters:
+    - name_contains: Case-insensitive substring match against the object name
+    - type: Exact object type - 'MESH', 'ARMATURE', 'EMPTY', 'CAMERA', etc.
+    - collection: Restrict to objects in this collection, including its nested
+      sub-collections (Collection.all_objects). See get_collection_tree for
+      names.
+    - visible_only: Only objects currently visible in the viewport
+      (obj.visible_get() - accounts for collection exclusion and hide toggles)
+    - selected_only: Only currently selected objects
+    - max_results: Cap on objects returned (default 50; 0 for all). The true
+      match count (`total_matches`) is reported even when the list is capped.
+    """
+    result = get_blender_connection().send_command(
+        "find_objects",
+        {"name_contains": name_contains, "type": type, "collection": collection,
+         "visible_only": visible_only, "selected_only": selected_only,
+         "max_results": max_results})
+    return json.dumps(result, indent=2, ensure_ascii=False)
 
 
 @mcp.tool()

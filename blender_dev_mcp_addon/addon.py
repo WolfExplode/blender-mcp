@@ -511,6 +511,75 @@ class BlenderDevMCPServer:
                         info["mesh"]["selection"] = {"error": str(exc)}
         return info
 
+    @command("get_collection_tree")
+    def get_collection_tree(self, max_items=20):
+        """The Outliner's collection hierarchy, not the flat object list.
+
+        Nesting and per-collection visibility come from the active view
+        layer's LayerCollection tree, not from bpy.data.collections - the same
+        collection can be excluded in one view layer and not another, and only
+        the view layer knows which. Object membership is direct (coll.objects),
+        not recursive, so each collection in the tree shows only what the
+        Outliner would show unindented under it.
+        """
+        def build(layer_coll):
+            coll = layer_coll.collection
+            return {
+                "name": coll.name,
+                "excluded": layer_coll.exclude,
+                "hidden": layer_coll.hide_viewport or coll.hide_viewport,
+                "objects": self._capped(
+                    (o.name for o in coll.objects), max_items),
+                "children": [build(c) for c in layer_coll.children],
+            }
+        return build(bpy.context.view_layer.layer_collection)
+
+    @command("find_objects")
+    def find_objects(self, name_contains=None, type=None, collection=None,
+                     visible_only=False, selected_only=False, max_results=50):
+        """Filter bpy.context.scene.objects instead of truncating it.
+
+        `collection` scopes the search to a named collection via
+        Collection.all_objects, which is recursive into sub-collections - a
+        collection can't nest into itself, so no cycle guard is needed. Every
+        other filter is a plain AND over the candidate set.
+        """
+        if collection:
+            coll = bpy.data.collections.get(collection)
+            if coll is None:
+                raise ValueError(f"Collection not found: {collection}")
+            candidates = coll.all_objects
+        else:
+            candidates = bpy.context.scene.objects
+
+        needle = name_contains.lower() if name_contains else None
+        matches = []
+        for obj in candidates:
+            if type and obj.type != type:
+                continue
+            if needle and needle not in obj.name.lower():
+                continue
+            if selected_only and not obj.select_get():
+                continue
+            if visible_only and not obj.visible_get():
+                continue
+            matches.append(obj)
+
+        total = len(matches)
+        shown = matches[:max_results] if max_results else matches
+        return {
+            "total_matches": total,
+            "showing": len(shown),
+            "objects": [{
+                "name": o.name,
+                "type": o.type,
+                "collections": [c.name for c in o.users_collection],
+                "location": [round(float(v), 4) for v in o.location],
+                "visible": o.visible_get(),
+                "selected": o.select_get(),
+            } for o in shown],
+        }
+
     @command("get_viewport_screenshot")
     def get_viewport_screenshot(self, max_size=800, filepath=None, format="png"):
         """Render the 3D viewport to `filepath`.
