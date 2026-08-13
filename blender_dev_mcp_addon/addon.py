@@ -30,7 +30,7 @@ from bpy.props import IntProperty
 # back to loading the sibling by path. Keeping both paths working is what lets
 # the addon tests run without installing the addon.
 try:
-    from . import geonodes, ntp_bridge, undo
+    from . import geonodes, ntp_bridge, state, undo
 except ImportError:
     import importlib.util
     import os
@@ -44,6 +44,7 @@ except ImportError:
 
     geonodes = _load_sibling("geonodes.py", "blender_dev_mcp_geonodes")
     ntp_bridge = _load_sibling("ntp_bridge.py", "blender_dev_mcp_ntp_bridge")
+    state = _load_sibling("state.py", "blender_dev_mcp_state")
     # `undo` carries a live counter of how many revert points we pushed, so it
     # must exist exactly once. This file is the only importer for that reason -
     # geonodes and ntp_bridge take an undo_push=False flag and hand the push
@@ -596,7 +597,8 @@ class BlenderDevMCPServer:
                 "filepath": filepath, "method": method}
 
     @command("execute_code")
-    def execute_code(self, code, undo_label=None):
+    def execute_code(self, code, undo_label=None, dry_run=False,
+                     rollback_on_error=True, max_diff_items=20):
         """Run Python in Blender and return everything it printed.
 
         Captures stdout *and* stderr, and on failure returns the output produced
@@ -608,6 +610,22 @@ class BlenderDevMCPServer:
         back. It is opt-in because most code sent here only reads: pushing a
         revert point for every diagnostic print would bury the user's own edit
         history under our noise, and each push copies the whole file.
+
+        Two things make a write here safe to attempt rather than merely
+        recoverable, and both work by running the code and then taking it back:
+
+        `dry_run` previews. Arbitrary Python cannot be analysed for what it
+        would do, so the only truthful preview is to do it, fingerprint what
+        moved, and undo. What comes back is the diff, not a changed file. It
+        needs no `undo_label` and refuses outright if Blender will not accept an
+        undo push, because a preview that cannot be reverted is just an edit.
+
+        `rollback_on_error` makes a labelled write atomic. A loop that raises on
+        item 200 of 405 has already applied 199 changes, and previously they
+        stayed applied with a revert point sitting next to them - recoverable,
+        but only for a caller who noticed and chose to spend it. Partial state
+        from a failed script is essentially never what anyone wanted, so the
+        default is to spend it automatically and report that it was spent.
         """
         # Pre-import what almost every snippet needs. `__name__` is set to a
         # non-"__main__" value on purpose: without it `if __name__ ==
@@ -624,12 +642,25 @@ class BlenderDevMCPServer:
         err_buffer = io.StringIO()
         failed = False
 
+        # A dry run is a labelled edit whose label nobody chose, so give it one.
+        label = undo_label or ("dry run" if dry_run else None)
+        before = None
+
         # Isolate anything an earlier unlabelled call left unpushed into its own
         # step, so undoing this edit reverts this edit and not also that drift.
         # Uncounted: it is a boundary, not somewhere anyone means to return to.
-        if undo_label:
-            undo.push(f"before MCP {undo_label}", counts=False)
+        if label:
+            boundary = undo.push(f"before MCP {label}", counts=False)
+            if dry_run and not boundary:
+                raise Exception(
+                    "Cannot dry-run here: Blender would not accept an undo "
+                    "push, so the code could not be guaranteed revertible and "
+                    "was not run at all. Re-send without dry_run only if you "
+                    "mean to keep the change.")
+        if dry_run:
+            before = state.fingerprint()
 
+        pushed = False
         try:
             with redirect_stdout(out_buffer), redirect_stderr(err_buffer):
                 exec(code, namespace)
@@ -637,12 +668,25 @@ class BlenderDevMCPServer:
             failed = True
             err_buffer.write(traceback.format_exc())
         finally:
-            # Pushed even when the code raised, and that is the important case:
-            # a snippet that failed halfway has already changed the file, and
-            # without a revert point that partial edit is the one thing that
-            # could not be taken back.
-            if undo_label:
-                undo.push(f"MCP {undo_label}")
+            # Fingerprint before the push, and push even when the code raised.
+            # The failure case is the important one: a snippet that died halfway
+            # has already changed the file, and without a revert point that
+            # partial edit is the one thing that could not be taken back.
+            after = state.fingerprint() if dry_run else None
+            if label:
+                pushed = undo.push(f"MCP {label}")
+
+        changes = state.diff(before, after) if dry_run else None
+
+        # Give back whatever was just done, if it was never meant to be kept or
+        # was abandoned half-finished. Both cases are the same operation.
+        reverted, revert_error = False, None
+        if pushed and (dry_run or (failed and rollback_on_error)):
+            try:
+                undo.undo(1)
+                reverted = True
+            except Exception as exc:
+                revert_error = f"{type(exc).__name__}: {exc}"
 
         output = out_buffer.getvalue()
         errors = err_buffer.getvalue()
@@ -652,9 +696,39 @@ class BlenderDevMCPServer:
             output += errors
 
         if failed:
-            raise Exception(f"Code execution error:\n{output}")
+            # Say what the file looks like now, because "it raised" and "it
+            # raised and left 199 renames behind" call for different next moves.
+            if dry_run:
+                note = ("Nothing was kept - this was a dry run."
+                        if reverted else
+                        "WARNING: the dry run could not be reverted, so any "
+                        "change it made before failing is still applied.")
+            elif reverted:
+                note = ("The partial change was rolled back; the file is as it "
+                        "was before this call.")
+            elif not label:
+                note = ("No undo_label was set, so any partial change is still "
+                        "applied and cannot be taken back through this tooling.")
+            elif not rollback_on_error:
+                note = ("Any partial change is still applied. undo_edit() takes "
+                        "it back.")
+            else:
+                note = ("WARNING: rollback failed, so any partial change is "
+                        f"still applied ({revert_error}).")
+            detail = ""
+            if dry_run and changes:
+                detail = ("\n\nIt had already made these changes when it "
+                          f"failed:\n{json.dumps(state.summarise(changes, max_diff_items), indent=2, ensure_ascii=False)}")
+            raise Exception(f"Code execution error:\n{output}\n{note}{detail}")
+
         result = {"executed": True, "result": output}
-        if undo_label:
+        if dry_run:
+            result["dry_run"] = True
+            result["reverted"] = reverted
+            if revert_error:
+                result["revert_error"] = revert_error
+            result.update(state.summarise(changes, max_diff_items))
+        if label:
             result["undo_budget"] = undo.budget()
         return result
 
@@ -723,14 +797,14 @@ class BlenderDevMCPServer:
         return ntp_bridge.snapshot_tree(name, path, keep_last=keep_last)
 
     @command("undo_edit")
-    def undo_edit(self, steps=1):
+    def undo_edit(self, steps=1, all_steps=False):
         """Take back writes this session made, using Blender's undo stack.
 
         This is the reverse gear for edits, and restore_node_snapshot is not:
         undo puts the tree back in place, keeping the identity that objects and
         modifier inputs are bound to, where a restore builds a copy alongside.
         """
-        return undo.undo(steps)
+        return undo.undo(steps, all_steps=all_steps)
 
     @command("restore_node_snapshot")
     def restore_node_snapshot(self, path):

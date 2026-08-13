@@ -331,11 +331,17 @@ def get_object_info(ctx: Context, object_name: str, max_items: int = 40) -> str:
 
 
 @mcp.tool()
-def execute_blender_code(ctx: Context, code: str, undo_label: str = None) -> str:
+def execute_blender_code(ctx: Context, code: str, undo_label: str = None,
+                         dry_run: bool = False, rollback_on_error: bool = True,
+                         max_diff_items: int = 20) -> str:
     """Execute Python inside Blender and return everything it printed.
 
     Captures stdout and stderr. If the code raises, the error includes both the
     output produced before the exception and the full traceback.
+
+    This is the general-purpose tool here, and deliberately so: the read tools
+    answer fixed questions, and anything else is a few lines of bpy. Reach for
+    it freely to read; use dry_run before it writes.
 
     Parameters:
     - code: Python source to execute. `bpy`, `bmesh`, `mathutils` and `math`
@@ -346,14 +352,51 @@ def execute_blender_code(ctx: Context, code: str, undo_label: str = None) -> str
       It registers the edit as one step, which makes it a single Ctrl-Z for the
       user and lets undo_edit take it back. Leave it unset for code that only
       reads - an unlabelled edit cannot be undone through this tooling.
+    - dry_run: Run the code, report what it changed, then put it back. Use this
+      before any bulk write - it is the difference between proposing an edit and
+      making one, and on someone's open unsaved file that difference is the
+      whole game. What comes back is a diff of what was created, deleted and
+      renamed. Two limits: it compares names and existence only, so a pure value
+      assignment shows as no change; and it cannot take back writes outside the
+      blend file, so code that saves, exports or deletes on disk is NOT made
+      safe by it.
+    - rollback_on_error: When labelled code raises partway, take back what it
+      already did (default true). Turn it off only to inspect the wreckage of a
+      half-applied edit.
+    - max_diff_items: Cap on entries listed per change kind (default 20). The
+      full counts are always reported.
     """
     result = get_blender_connection().send_command(
-        "execute_code", {"code": code, "undo_label": undo_label})
-    return result.get("result", "") or "(no output)"
+        "execute_code", {"code": code, "undo_label": undo_label,
+                         "dry_run": dry_run,
+                         "rollback_on_error": rollback_on_error,
+                         "max_diff_items": max_diff_items})
+
+    output = result.get("result", "") or "(no output)"
+    if not result.get("dry_run"):
+        return output
+
+    changed = result.get("changed") or {}
+    report = ["[dry run - nothing was kept]" if result.get("reverted")
+              else "[dry run - WARNING: could not be reverted, the change is "
+                   f"still applied: {result.get('revert_error')}]"]
+    if changed:
+        report.append(json.dumps({"changed": changed,
+                                  "totals": result.get("totals", {})},
+                                 indent=2, ensure_ascii=False))
+    else:
+        report.append(
+            "No datablock was created, deleted or renamed. If the code was "
+            "meant to assign values rather than rename things, that is expected "
+            "- a dry run cannot see it. Verify by reading the values back.")
+    if output != "(no output)":
+        report.append("--- output ---")
+        report.append(output)
+    return "\n".join(report)
 
 
 @mcp.tool()
-def undo_edit(ctx: Context, steps: int = 1) -> str:
+def undo_edit(ctx: Context, steps: int = 1, all_steps: bool = False) -> str:
     """Take back edits this session made to the blend file, in place.
 
     This is the reverse gear, and restore_node_snapshot is not: undo puts a
@@ -372,8 +415,14 @@ def undo_edit(ctx: Context, steps: int = 1) -> str:
 
     Parameters:
     - steps: How many steps to take back. Defaults to 1, the last write.
+    - all_steps: Take back everything this session pushed and still owns,
+      ignoring `steps`. The escape hatch after a bulk edit spread over several
+      calls, where undoing by hand means knowing what each call contributed and
+      guessing low leaves the file half-reverted. The targeting caveat above
+      applies more strongly the further back it walks.
     """
-    result = get_blender_connection().send_command("undo_edit", {"steps": steps})
+    result = get_blender_connection().send_command(
+        "undo_edit", {"steps": steps, "all_steps": all_steps})
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 

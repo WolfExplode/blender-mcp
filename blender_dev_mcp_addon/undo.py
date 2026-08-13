@@ -26,9 +26,11 @@ Measured on Blender 5.1, because none of it is guessable from the docs:
     afterwards raises ReferenceError("StructRNA ... has been removed"). Nothing
     may hold a handle across an undo; re-fetch by name on the far side.
 
-The push counter exists so that undoing can be bounded. Blender 5.1 exposes no
-way to read the undo stack, so the only defence against walking back into the
-user's own edit history is to refuse to take more steps than we contributed.
+The push bookkeeping exists so that undoing can be bounded. Blender 5.1 exposes
+no way to read the undo stack, so the only defence against walking back into the
+user's own edit history is to refuse to take more steps than we contributed -
+and, because a revert point can occupy more than one stack entry, to know how
+many each of ours cost.
 
 That is a version-scoped limitation, not a permanent one. Blender's main branch
 adds rna_wm_undo.cc, giving `wm.undo_stack` with `.steps`, `.active_index` and a
@@ -43,10 +45,21 @@ on upgrade; a `getattr(wm, "undo_stack", None)` probe is enough to detect it.
 
 import bpy
 
-# How many revert points this session has pushed and not yet consumed. Module
-# level rather than per-connection: the undo stack is per-Blender, so a counter
-# scoped to anything narrower would lose track across a reconnect.
-_pushed = 0
+# What this session pushed and has not yet consumed: one entry per revert point
+# a caller can ask for, holding how many *raw* undo-stack entries that revert
+# point occupies. Module level rather than per-connection, because the undo
+# stack is per-Blender and anything narrower would lose track across a reconnect.
+#
+# A list rather than a count because the cost is not uniform. A labelled
+# execute_code pushes a boundary step as well as its own, where annotate and
+# restore push only one - so "undo three edits" is not "take three steps", and
+# treating it as such silently under-reverts. Measured on Blender 5.1: reverting
+# K labelled execute_code edits takes 2K-1 raw steps, not K.
+_pushed = []
+
+# Boundary pushes seen since the last counted one. They belong to the revert
+# point that follows them, and are attributed to it when it arrives.
+_pending = 0
 
 
 def push(message, counts=True):
@@ -57,10 +70,11 @@ def push(message, counts=True):
 
     `counts=False` is for the defensive push taken before an edit, which exists
     to isolate any earlier unpushed drift into its own step rather than to be
-    a step anyone will deliberately return to. Counting it would let `undo`
-    take two steps for one edit.
+    a step anyone will deliberately return to. It is not a revert point of its
+    own, but it does occupy a stack entry, so it is charged to the edit it
+    precedes rather than ignored.
     """
-    global _pushed
+    global _pushed, _pending
     try:
         bpy.ops.ed.undo_push(message=message)
     except (RuntimeError, AttributeError):
@@ -69,16 +83,34 @@ def push(message, counts=True):
         # rather than raised.
         return False
     if counts:
-        _pushed += 1
+        _pushed.append(1 + _pending)
+        _pending = 0
+    else:
+        _pending += 1
     return True
 
 
 def budget():
-    """How many steps `undo` is currently willing to take."""
-    return _pushed
+    """How many revert points `undo` is currently willing to take back."""
+    return len(_pushed)
 
 
-def undo(steps=1):
+def _raw_steps(count):
+    """Raw undo steps needed to take back the newest `count` revert points.
+
+    Every entry costs its own stack slots, except that the oldest one's
+    boundary is the state being returned *to* - it is landed on, not stepped
+    past. That is the -1, and without it a full revert overshoots into whatever
+    came before, which on a user's file is their work.
+    """
+    entries = _pushed[-count:]
+    raw = sum(entries)
+    if entries[0] > 1:
+        raw -= 1
+    return raw
+
+
+def undo(steps=1, all_steps=False):
     """Step back through revert points this session pushed.
 
     Refuses to exceed the push count. The counter is the only guard available,
@@ -86,47 +118,75 @@ def undo(steps=1):
     user edits in the Blender UI between an MCP write and this call, their
     action is the more recent step and it is the one that comes off first.
     Undoing right after writing is the only usage that is precisely targeted.
+
+    `all_steps` takes back everything this session pushed and still owns. It is
+    the "get me out of this" path: after a bulk edit spread over several calls,
+    unwinding by hand means knowing how many steps each call contributed, and
+    guessing low leaves a half-reverted file. The same targeting caveat applies,
+    more so - the further back it walks, the likelier a user edit is in the way.
     """
-    global _pushed
+    global _pushed, _pending
+    held = len(_pushed)
+    if all_steps:
+        if held < 1:
+            return {"undone": 0, "requested": 0, "remaining_budget": 0,
+                    "note": "Nothing to undo: this session pushed no revert points."}
+        steps = held
     if steps < 1:
         raise ValueError(f"steps must be at least 1, got {steps}")
-    if _pushed < 1:
+    if held < 1:
         raise ValueError(
             "Nothing to undo: this session has not pushed any revert points. "
             "Undoing anyway would step into edits made in Blender itself, "
             "which are the user's to unwind.")
-    if steps > _pushed:
+    if steps > held:
         raise ValueError(
-            f"Asked to undo {steps} steps but only {_pushed} were pushed by "
+            f"Asked to undo {steps} steps but only {held} were pushed by "
             "this session. Refusing, so that the user's own edit history is "
             "not consumed.")
 
-    taken = 0
-    for _ in range(steps):
+    # One revert point is not one stack step, so the loop runs over raw steps
+    # and the budget is settled afterwards from what actually landed.
+    wanted_raw = _raw_steps(steps)
+    taken_raw = 0
+    error = None
+    for _ in range(wanted_raw):
         try:
             bpy.ops.ed.undo()
         except (RuntimeError, AttributeError) as exc:
-            return {
-                "undone": taken,
-                "requested": steps,
-                "remaining_budget": _pushed,
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-        taken += 1
-        _pushed -= 1
+            error = f"{type(exc).__name__}: {exc}"
+            break
+        taken_raw += 1
 
-    return {
-        "undone": taken,
+    # Ownership is given up either way. On a clean run that is bookkeeping; on a
+    # short one it is deliberate - the file then sits between revert points, the
+    # entries no longer describe the stack, and a wrong count is worse than none
+    # because it would send a later undo walking into the user's own history.
+    undone = steps if taken_raw == wanted_raw else 0
+    del _pushed[-steps:]
+    _pending = 0
+
+    result = {
+        "undone": undone,
         "requested": steps,
-        "remaining_budget": _pushed,
+        "raw_steps": taken_raw,
+        "remaining_budget": len(_pushed),
         # Worth stating in the result: a caller that cached a tree or node from
         # before this call is now holding dead pointers.
         "note": ("References taken before this call are now invalid; "
                  "re-read the tree by name to see the reverted state."),
     }
+    if error:
+        result["error"] = error
+        result["note"] = (
+            f"Undo stopped after {taken_raw} of {wanted_raw} steps, so the file "
+            "is part-way between revert points. This session has given up "
+            "tracking them; check the state before writing again.")
+    return result
 
 
 def reset():
-    """Forget the push count. For tests, which share one Blender session."""
-    global _pushed
-    _pushed = 0
+    """Forget what was pushed. For tests, and for a file load that voids it."""
+    global _pushed, _pending
+    _pushed = []
+    _pending = 0

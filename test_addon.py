@@ -536,7 +536,7 @@ def test_undo_budget_is_cleared_when_a_file_is_loaded(m):
     # would not, leaving undo_edit convinced it owns steps that no longer exist.
     # Spending that stale budget walks into the new file's own history.
     m.undo.reset()
-    m.undo._pushed = 4
+    m.undo._pushed = [2, 2, 1, 1]
     m._reset_undo_budget_on_load(None)
     assert m.undo.budget() == 0, "a file load must void the budget"
 
@@ -1020,11 +1020,13 @@ def test_labelled_edit_is_revertible(m):
         _drop_tree("__undo_ok__")
 
 
-def test_edit_that_raised_is_still_revertible(m):
+def test_edit_that_raised_is_rolled_back(m):
     """A snippet that failed halfway has already changed the file.
 
-    This is the case the revert point matters most for, so the push happens in
-    a finally rather than only on the success path.
+    The revert point matters most here, so the push happens in a finally rather
+    than only on the success path - and by default it is spent immediately.
+    Partial state from a script that died is essentially never wanted, and
+    leaving it applied only helps a caller who both noticed and knew to undo.
     """
     import bpy
     tree = _undo_baseline(m, "__undo_boom__")
@@ -1037,15 +1039,252 @@ def test_edit_that_raised_is_still_revertible(m):
                 undo_label="edit that fails")
         except Exception as exc:
             assert "halfway" in str(exc), exc
+            assert "rolled back" in str(exc), \
+                f"the caller must be told the file was restored:\n{exc}"
         else:
             raise AssertionError("expected the snippet to raise")
 
-        assert len(bpy.data.node_groups["__undo_boom__"].nodes) == 2
-        assert m.undo.budget() == 1
-        server.undo_edit()
-        assert len(bpy.data.node_groups["__undo_boom__"].nodes) == 1
+        assert len(bpy.data.node_groups["__undo_boom__"].nodes) == 1, \
+            "the half-applied edit should have been taken back"
+        assert m.undo.budget() == 0, "the revert point was spent, not left"
     finally:
         _drop_tree("__undo_boom__")
+
+
+def test_rollback_on_error_can_be_declined(m):
+    """Opting out leaves the wreckage in place, with a revert point beside it."""
+    import bpy
+    tree = _undo_baseline(m, "__undo_keep__")
+    try:
+        server = m.BlenderDevMCPServer()
+        try:
+            server.execute_code(
+                "bpy.data.node_groups['__undo_keep__'].nodes.new('ShaderNodeMath')\n"
+                "raise RuntimeError('halfway')",
+                undo_label="edit that fails", rollback_on_error=False)
+        except Exception as exc:
+            assert "still applied" in str(exc), exc
+        else:
+            raise AssertionError("expected the snippet to raise")
+
+        assert len(bpy.data.node_groups["__undo_keep__"].nodes) == 2
+        assert m.undo.budget() == 1
+        server.undo_edit()
+        assert len(bpy.data.node_groups["__undo_keep__"].nodes) == 1
+    finally:
+        _drop_tree("__undo_keep__")
+
+
+def test_undo_all_steps_unwinds_the_whole_session(m):
+    """The escape hatch after a bulk edit spread over several calls."""
+    import bpy
+    tree = _undo_baseline(m, "__undo_all__")
+    try:
+        server = m.BlenderDevMCPServer()
+        for i in range(3):
+            server.execute_code(
+                "bpy.data.node_groups['__undo_all__'].nodes.new('ShaderNodeMath')",
+                undo_label=f"add math node {i}")
+        assert m.undo.budget() == 3
+        assert len(bpy.data.node_groups["__undo_all__"].nodes) == 4
+
+        report = server.undo_edit(all_steps=True)
+        assert report["undone"] == 3, report
+        assert report["remaining_budget"] == 0, report
+        assert len(bpy.data.node_groups["__undo_all__"].nodes) == 1
+    finally:
+        _drop_tree("__undo_all__")
+
+
+def test_undoing_several_edits_reverts_all_of_them(m):
+    """One revert point is not one undo step.
+
+    A labelled execute_code pushes a boundary entry as well as its own, so
+    reverting K of them takes 2K-1 raw steps (measured on 5.1). Taking K
+    instead lands between revert points and quietly leaves most of the edit
+    applied, while reporting success - which is the worst way for a reverse
+    gear to fail.
+    """
+    import bpy
+    tree = _undo_baseline(m, "__undo_multi__")
+    try:
+        server = m.BlenderDevMCPServer()
+        for i in range(3):
+            server.execute_code(
+                "bpy.data.node_groups['__undo_multi__'].nodes.new('ShaderNodeMath')",
+                undo_label=f"add math node {i}")
+        assert len(bpy.data.node_groups["__undo_multi__"].nodes) == 4
+
+        report = server.undo_edit(steps=3)
+        assert report["undone"] == 3, report
+        assert report["raw_steps"] == 5, \
+            f"expected 2*3-1 raw undo steps, got {report}"
+        assert len(bpy.data.node_groups["__undo_multi__"].nodes) == 1, \
+            "undoing every revert point must leave nothing of the edits"
+    finally:
+        _drop_tree("__undo_multi__")
+
+
+def test_partial_revert_leaves_the_earlier_edits_alone(m):
+    """Undoing one of three reverts exactly one."""
+    import bpy
+    tree = _undo_baseline(m, "__undo_partial__")
+    try:
+        server = m.BlenderDevMCPServer()
+        for i in range(3):
+            server.execute_code(
+                "bpy.data.node_groups['__undo_partial__'].nodes.new('ShaderNodeMath')",
+                undo_label=f"add math node {i}")
+        server.undo_edit(steps=1)
+        assert len(bpy.data.node_groups["__undo_partial__"].nodes) == 3, \
+            "one revert point should take back exactly one edit"
+        assert m.undo.budget() == 2
+    finally:
+        _drop_tree("__undo_partial__")
+
+
+def test_undo_all_steps_on_an_empty_budget_is_not_an_error(m):
+    # "put everything back" is a reasonable thing to ask when nothing is
+    # outstanding, and refusing with an exception would make it unsafe to call
+    # defensively - which is exactly when it would be called.
+    m.undo.reset()
+    report = m.BlenderDevMCPServer().undo_edit(all_steps=True)
+    assert report["undone"] == 0, report
+
+
+# ---------------------------------------------------------------- dry run
+
+def test_dry_run_reports_the_change_and_keeps_none_of_it(m):
+    import bpy
+    tree = _undo_baseline(m, "__dry_make__")
+    try:
+        result = m.BlenderDevMCPServer().execute_code(
+            "bpy.data.node_groups.new('__dry_spawned__', 'GeometryNodeTree')",
+            dry_run=True)
+        assert result["dry_run"] is True and result["reverted"] is True, result
+        created = result["changed"]["node_groups"]["created"]
+        assert "__dry_spawned__" in created, result
+        assert bpy.data.node_groups.get("__dry_spawned__") is None, \
+            "a dry run must not leave the datablock behind"
+    finally:
+        _drop_tree("__dry_make__")
+        _drop_tree("__dry_spawned__")
+
+
+def test_dry_run_reports_a_rename_as_a_rename(m):
+    """Identity by pointer, not by name.
+
+    Comparing name sets alone would call this one deletion and one creation,
+    which for a bulk rename means a report twice the size that never says the
+    word "renamed". This is the property the whole diff is built on.
+    """
+    import bpy
+    tree = _undo_baseline(m, "__dry_rename__")
+    try:
+        result = m.BlenderDevMCPServer().execute_code(
+            "bpy.data.node_groups['__dry_rename__'].name = '__dry_renamed__'",
+            dry_run=True)
+        renamed = result["changed"]["node_groups"]["renamed"]
+        assert {"from": "__dry_rename__", "to": "__dry_renamed__"} in renamed, result
+        assert "created" not in result["changed"]["node_groups"], \
+            f"a rename must not be reported as a creation: {result}"
+        assert bpy.data.node_groups.get("__dry_rename__") is not None, \
+            "the original name should be back"
+    finally:
+        _drop_tree("__dry_rename__")
+        _drop_tree("__dry_renamed__")
+
+
+def test_dry_run_reverts_even_when_the_code_raises(m):
+    """The half-applied preview is the one that most needs putting back."""
+    import bpy
+    tree = _undo_baseline(m, "__dry_boom__")
+    try:
+        try:
+            m.BlenderDevMCPServer().execute_code(
+                "bpy.data.node_groups.new('__dry_partial__', 'GeometryNodeTree')\n"
+                "raise RuntimeError('halfway')",
+                dry_run=True)
+        except Exception as exc:
+            assert "halfway" in str(exc), exc
+            assert "Nothing was kept" in str(exc), exc
+            assert "__dry_partial__" in str(exc), \
+                f"the report should say what it had done before failing:\n{exc}"
+        else:
+            raise AssertionError("expected the snippet to raise")
+        assert bpy.data.node_groups.get("__dry_partial__") is None, \
+            "a failed dry run must still be reverted"
+    finally:
+        _drop_tree("__dry_boom__")
+        _drop_tree("__dry_partial__")
+
+
+def test_dry_run_of_read_only_code_reports_no_change(m):
+    tree = _undo_baseline(m, "__dry_read__")
+    try:
+        result = m.BlenderDevMCPServer().execute_code(
+            "print(len(bpy.data.objects))", dry_run=True)
+        assert result["changed"] == {}, result
+        assert result["result"].strip().isdigit(), result
+    finally:
+        _drop_tree("__dry_read__")
+
+
+def test_dry_run_spends_its_own_revert_point(m):
+    # A preview that leaves budget behind would make undo_edit walk back into
+    # an edit the caller was told had already been undone.
+    tree = _undo_baseline(m, "__dry_budget__")
+    try:
+        m.BlenderDevMCPServer().execute_code(
+            "bpy.data.node_groups.new('__dry_budget_spawn__', 'GeometryNodeTree')",
+            dry_run=True)
+        assert m.undo.budget() == 0, "a reverted dry run should own no steps"
+    finally:
+        _drop_tree("__dry_budget__")
+        _drop_tree("__dry_budget_spawn__")
+
+
+def test_dry_run_sees_renames_of_subitems(m):
+    """Bones and vertex groups are not datablocks, and get renamed constantly."""
+    import bpy
+    mesh = bpy.data.meshes.new("__dry_vg_mesh__")
+    obj = bpy.data.objects.new("__dry_vg_obj__", mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    obj.vertex_groups.new(name="original")
+    m.undo.reset()
+    bpy.ops.ed.undo_push(message="baseline for subitem dry run")
+    try:
+        result = m.BlenderDevMCPServer().execute_code(
+            "bpy.data.objects['__dry_vg_obj__'].vertex_groups['original']"
+            ".name = 'renamed'",
+            dry_run=True)
+        renamed = result["changed"]["vertex_groups"]["renamed"]
+        assert {"from": "original", "to": "renamed"} in renamed, result
+    finally:
+        for name in ("__dry_vg_obj__",):
+            leftover = bpy.data.objects.get(name)
+            if leftover is not None:
+                bpy.data.objects.remove(leftover)
+        leftover = bpy.data.meshes.get("__dry_vg_mesh__")
+        if leftover is not None:
+            bpy.data.meshes.remove(leftover)
+
+
+def test_dry_run_caps_long_lists_but_keeps_the_count(m):
+    tree = _undo_baseline(m, "__dry_many__")
+    try:
+        result = m.BlenderDevMCPServer().execute_code(
+            "for i in range(30):\n"
+            "    bpy.data.node_groups.new(f'__dry_many_{i}__', 'GeometryNodeTree')",
+            dry_run=True, max_diff_items=5)
+        entry = result["changed"]["node_groups"]
+        assert len(entry["created"]) == 5, entry
+        assert entry["created_omitted"] == 25, entry
+        assert result["totals"]["node_groups.created"] == 30, result
+    finally:
+        _drop_tree("__dry_many__")
+        for i in range(30):
+            _drop_tree(f"__dry_many_{i}__")
 
 
 def test_unlabelled_edit_is_not_undoable(m):

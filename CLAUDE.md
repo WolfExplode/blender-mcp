@@ -8,7 +8,14 @@ separate processes, talking JSON over a local socket on port 9876:
 - `blender_dev_mcp_addon/addon.py` — the Blender addon. `SocketTransport` owns
   sockets, threads and framing; `BlenderDevMCPServer` owns dispatch and the
   handlers, which are declared with `@command("name")`. Domain logic lives
-  alongside in `geonodes.py`, `ntp_bridge.py` and `undo.py`.
+  alongside in `geonodes.py`, `ntp_bridge.py`, `state.py` and `undo.py`.
+
+`state.py` and `undo.py` are what make a write safe to attempt: `state.py`
+fingerprints the file by datablock address so a change can be diffed, and
+`undo.py` owns the revert points. Both are load-bearing for `dry_run`, which
+runs the code, diffs it and undoes it. Read `undo.py`'s docstring before
+touching either — its behaviour was measured against 5.1, not inferred, and the
+one thing that is easy to get wrong is that a revert point is not a stack step.
 
 One tool, `blender_docs`, needs no Blender at all — it reads the offline docs
 described below, and is served entirely from `src/blender_dev_mcp/docs.py`.
