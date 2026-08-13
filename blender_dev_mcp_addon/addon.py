@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import traceback
+import unicodedata
 from collections import deque
 from contextlib import redirect_stdout, redirect_stderr, suppress
 
@@ -442,6 +443,41 @@ class BlenderDevMCPServer:
         ]
 
     @staticmethod
+    def _resolve_name(bpy_collection, name, kind):
+        """Look up `name` in a bpy_prop_collection, tolerant of Unicode drift.
+
+        MCP names arrive as plain JSON strings that can drift from what
+        Blender actually stored through routes that never touch Blender at
+        all - a name re-typed from a prior tool response, an editor that
+        normalizes on paste, a fullwidth "－" (U+FF0D) silently retyped as an
+        ASCII "-" (U+002D). Printed, the two are indistinguishable; compared
+        as strings, they are not, so bpy.data.objects.get(name) raises
+        "not found" for a name a person would call correct. NFKC folds width
+        and compatibility variants together and catches exactly that class of
+        mismatch without conflating names that actually differ.
+
+        Tries the exact name first - the common case, and the only one that
+        can't misfire on two distinct objects that happen to normalize the
+        same. Falls back to a normalized scan only on a miss.
+        """
+        exact = bpy_collection.get(name)
+        if exact is not None:
+            return exact
+
+        target = unicodedata.normalize("NFKC", name)
+        matches = [item for item in bpy_collection
+                  if unicodedata.normalize("NFKC", item.name) == target]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            names = ", ".join(repr(item.name) for item in matches)
+            raise ValueError(
+                f"{kind} not found: {name!r} - no exact match, and "
+                f"{len(matches)} names normalize to the same text so the "
+                f"match is ambiguous: {names}")
+        raise ValueError(f"{kind} not found: {name!r}")
+
+    @staticmethod
     def _capped(names, max_items):
         """A name list plus its true length, cut to `max_items`.
 
@@ -472,9 +508,7 @@ class BlenderDevMCPServer:
 
     @command("get_object_info")
     def get_object_info(self, name, max_items=40):
-        obj = bpy.data.objects.get(name)
-        if not obj:
-            raise ValueError(f"Object not found: {name}")
+        obj = self._resolve_name(bpy.data.objects, name, "Object")
 
         info = {
             "name": obj.name,
@@ -552,9 +586,7 @@ class BlenderDevMCPServer:
         caller relying on the fallback can tell selected from visible from all.
         """
         if collection:
-            coll = bpy.data.collections.get(collection)
-            if coll is None:
-                raise ValueError(f"Collection not found: {collection}")
+            coll = self._resolve_name(bpy.data.collections, collection, "Collection")
             pool = coll.all_objects
         else:
             pool = bpy.context.scene.objects
@@ -620,9 +652,7 @@ class BlenderDevMCPServer:
             roots = [o for o in bpy.context.scene.objects if o.parent is None]
             parent = None
         else:
-            obj = bpy.data.objects.get(name)
-            if obj is None:
-                raise ValueError(f"Object not found: {name}")
+            obj = self._resolve_name(bpy.data.objects, name, "Object")
             roots = list(obj.children)
             parent = {"name": obj.name, "type": obj.type}
 
