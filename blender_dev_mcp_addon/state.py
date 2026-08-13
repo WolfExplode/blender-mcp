@@ -95,13 +95,24 @@ def diff(before, after):
     return changes
 
 
-def summarise(changes, max_items=20):
+def summarise(changes, max_items=100):
     """Trim a diff for reporting, and count what was trimmed.
 
     A bulk rename produces hundreds of near-identical lines whose shape is
     obvious from the first few. Returning all of them buries the one kind of
     change the caller did not expect, which is the entire reason to look at a
     diff at all - so each list is capped and the remainder is counted.
+
+    The cap is deliberately high enough that a hand-authored edit is never cut.
+    Truncation is for the 400-bone rename, not for a mesh's worth of shape
+    keys, and a preview that hid a third of a 34-item change would be teaching
+    the caller to distrust it.
+
+    What is shown when the cap *does* bite is a head **and tail** sample, not
+    the first N. The lists are sorted by name, so cutting only the tail drops
+    whatever sorts last - and an unexpected `zzz_tmp` at the end of the
+    alphabet is precisely the entry this function claims to protect. Sampling
+    both ends costs nothing and cannot silently hide one extreme.
     """
     trimmed, totals = {}, {}
     for kind, entry in changes.items():
@@ -109,7 +120,9 @@ def summarise(changes, max_items=20):
         for action, items in entry.items():
             totals[f"{kind}.{action}"] = len(items)
             if max_items and len(items) > max_items:
-                out[action] = items[:max_items]
+                head = -(-max_items // 2)  # ceil, so odd caps favour the head
+                tail = max_items - head
+                out[action] = items[:head] + (items[-tail:] if tail else [])
                 out[f"{action}_omitted"] = len(items) - max_items
             else:
                 out[action] = items

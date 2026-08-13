@@ -1287,6 +1287,47 @@ def test_dry_run_caps_long_lists_but_keeps_the_count(m):
             _drop_tree(f"__dry_many_{i}__")
 
 
+def test_dry_run_samples_both_ends_of_a_capped_list(m):
+    """Truncation must not hide whatever sorts last.
+
+    The lists are name-sorted, so a head-only cut drops the tail of the
+    alphabet - and an unexpected entry is as likely to sort there as anywhere.
+    """
+    tree = _undo_baseline(m, "__dry_ends__")
+    try:
+        result = m.BlenderDevMCPServer().execute_code(
+            "for i in range(30):\n"
+            "    bpy.data.node_groups.new(f'__dry_ends_{i:02d}__', 'GeometryNodeTree')",
+            dry_run=True, max_diff_items=6)
+        created = result["changed"]["node_groups"]["created"]
+        assert len(created) == 6, created
+        assert created[0] == "__dry_ends_00__", created
+        assert created[-1] == "__dry_ends_29__", created
+        assert result["changed"]["node_groups"]["created_omitted"] == 24, result
+        assert result["totals"]["node_groups.created"] == 30, result
+    finally:
+        _drop_tree("__dry_ends__")
+        for i in range(30):
+            _drop_tree(f"__dry_ends_{i:02d}__")
+
+
+def test_dry_run_does_not_cap_an_ordinary_edit(m):
+    """The default cap exists for bulk renames, not for a mesh's shape keys."""
+    tree = _undo_baseline(m, "__dry_uncapped__")
+    try:
+        result = m.BlenderDevMCPServer().execute_code(
+            "for i in range(34):\n"
+            "    bpy.data.node_groups.new(f'__dry_uncapped_{i:02d}__', 'GeometryNodeTree')",
+            dry_run=True)
+        entry = result["changed"]["node_groups"]
+        assert len(entry["created"]) == 34, entry
+        assert "created_omitted" not in entry, entry
+    finally:
+        _drop_tree("__dry_uncapped__")
+        for i in range(34):
+            _drop_tree(f"__dry_uncapped_{i:02d}__")
+
+
 def test_unlabelled_edit_is_not_undoable(m):
     """No label means no revert point - and the tool says so rather than guessing."""
     import bpy

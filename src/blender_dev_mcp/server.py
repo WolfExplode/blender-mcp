@@ -333,7 +333,7 @@ def get_object_info(ctx: Context, object_name: str, max_items: int = 40) -> str:
 @mcp.tool()
 def execute_blender_code(ctx: Context, code: str, undo_label: str = None,
                          dry_run: bool = False, rollback_on_error: bool = True,
-                         max_diff_items: int = 20) -> str:
+                         max_diff_items: int = 100) -> str:
     """Execute Python inside Blender and return everything it printed.
 
     Captures stdout and stderr. If the code raises, the error includes both the
@@ -356,15 +356,23 @@ def execute_blender_code(ctx: Context, code: str, undo_label: str = None,
       before any bulk write - it is the difference between proposing an edit and
       making one, and on someone's open unsaved file that difference is the
       whole game. What comes back is a diff of what was created, deleted and
-      renamed. Two limits: it compares names and existence only, so a pure value
-      assignment shows as no change; and it cannot take back writes outside the
-      blend file, so code that saves, exports or deletes on disk is NOT made
-      safe by it.
+      renamed. Three limits: it compares names and existence only, so a pure
+      value assignment shows as no change; it watches bpy.data plus vertex
+      groups, bones and shape keys, so state an addon keeps in its own
+      PropertyGroup collections (mmd_root.vertex_morphs, rig metadata, modifier
+      settings) is invisible - and when an addon binds its records to datablocks
+      *by name*, a rename is exactly the edit whose risky half will not appear;
+      and it cannot take back writes outside the blend file, so code that saves,
+      exports or deletes on disk is NOT made safe by it. Print the post-state
+      yourself for anything the diff cannot see.
     - rollback_on_error: When labelled code raises partway, take back what it
       already did (default true). Turn it off only to inspect the wreckage of a
       half-applied edit.
-    - max_diff_items: Cap on entries listed per change kind (default 20). The
-      full counts are always reported.
+    - max_diff_items: Cap on entries listed per change kind (default 100; 0 for
+      no cap). High enough that hand-authored edits are never cut. Past the cap
+      you get a head-and-tail sample rather than the first N, because the lists
+      are name-sorted and the unexpected entry is as likely to sort last as
+      first. The full counts are always reported under "totals".
     """
     result = get_blender_connection().send_command(
         "execute_code", {"code": code, "undo_label": undo_label,

@@ -598,7 +598,7 @@ class BlenderDevMCPServer:
 
     @command("execute_code")
     def execute_code(self, code, undo_label=None, dry_run=False,
-                     rollback_on_error=True, max_diff_items=20):
+                     rollback_on_error=True, max_diff_items=100):
         """Run Python in Blender and return everything it printed.
 
         Captures stdout *and* stderr, and on failure returns the output produced
