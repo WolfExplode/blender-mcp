@@ -1262,10 +1262,13 @@ class BlenderDevMCPServer:
           covering the same rig with the same renames/substitutions: bone
           renames cascade to the matching vertex group automatically within
           this same call (see below), so by the time a vertex_group target
-          ran, those names would already be gone - every one of them would
-          report as "missing", harmlessly, but it's dead weight in the call.
-          Leave vertex_group out and let the cascade do it, the same as a
-          single-target bone rename already does.
+          ran, those names would already be gone. With renames (not
+          substitutions), that costs nothing to read - the bone target
+          already applied them, so cross-target missing tracking sees them
+          as found and says nothing - but the vertex_group target's own
+          "applied" count still reads 0, and it is still dead weight in the
+          call. Leave vertex_group out and let the cascade do it, the same
+          as a single-target bone rename already does.
 
           A failure partway through a target list rolls back every target
           already applied in this call, not just the one that raised - the
@@ -1347,11 +1350,16 @@ class BlenderDevMCPServer:
         With targets the report shape differs slightly to stay readable at
         scale: "targets" is a compact per-target list of
         {kind, object_name, requested, applied} (always present, cheap even
-        when everything succeeded); "missing" and "collisions" are flat
-        lists tagged with which target they came from, present only if
-        non-empty - a clean multi-target run costs nothing extra to read.
-        "requested"/"applied" at the top level are totals across every
-        target, same keys as the single-target form.
+        when everything succeeded). "collisions" is a flat list tagged with
+        which target it came from, present only if non-empty. "missing" is
+        judged once across every target rather than per target - a flat
+        list of old_names (same shape as the single-target form's, and the
+        same reasoning as unused_patterns) that no target found at all. A
+        name only some targets don't apply to - the ordinary case for a
+        shared translation dict spanning several kinds - isn't in it; only a
+        name genuinely absent everywhere is. A clean multi-target run costs
+        nothing extra to read. "requested"/"applied" at the top level are
+        totals across every target, same keys as the single-target form.
         """
         if (kind is None) == (targets is None):
             raise ValueError(
@@ -1468,8 +1476,19 @@ class BlenderDevMCPServer:
         before = state.fingerprint()
         target_reports = []
         total_requested = total_applied = 0
-        missing, collisions = [], []
+        collisions = []
         matched_patterns = set()
+        # For renames-mode only (substitutions never misses - see
+        # _substitution_renames): a name absent from *this* target's
+        # collection is routine, not a mistake - a translation dict shared
+        # across every kind in the file is mostly irrelevant to any one of
+        # them by construction (a bone name means nothing to the "material"
+        # target). Tagging every such non-match "missing", target by target,
+        # buried the one genuine typo in a translation pass under hundreds
+        # of expected non-matches. So, same as unused_patterns already does
+        # for substitutions, missing is judged once across every target: a
+        # name only earns the label if no target found it at all.
+        applied_anywhere = set()
         try:
             for kind, object_name, collection in resolved:
                 if substitutions is not None:
@@ -1483,8 +1502,8 @@ class BlenderDevMCPServer:
                 for old, new in this_renames.items():
                     item = collection.get(old)
                     if item is None:
-                        missing.append({"kind": kind, "object_name": object_name, "name": old})
                         continue
+                    applied_anywhere.add(old)
                     item.name = new
                     target_applied.append(old)
                     if item.name != new:
@@ -1498,6 +1517,7 @@ class BlenderDevMCPServer:
                                        "applied": len(target_applied)})
                 total_requested += len(this_renames)
                 total_applied += len(target_applied)
+            missing = sorted(set(renames) - applied_anywhere) if renames is not None else []
         except Exception:
             after = state.fingerprint()
             pushed = undo.push(f"MCP {label}")
@@ -1573,6 +1593,59 @@ class BlenderDevMCPServer:
             for name in names
         ]
 
+    # Names beyond this many owners are left bare rather than annotated - the
+    # common case for vertex_group/bone (a rig with an Armature modifier
+    # cascades one bone rename to the matching group on every bound mesh),
+    # where every owner sharing a name is the expected shape, not a lead.
+    _MAX_ANNOTATED_OWNERS = 3
+
+    @staticmethod
+    def _subitem_owners():
+        """{"vertex_groups"/"bones"/"shape_keys.key_blocks": {name: [owner, ...]}}
+        for the three contextual kinds, built by object/armature name (not
+        `state.py`'s pointer keys - this is a display aid, not a diff, and
+        owner *names* are exactly what a report needs to say).
+
+        Exists because a whole-file audit_names scan dedupes matches down to
+        distinct names, same as every other bucket - right for a bone name
+        cascaded across a rig's meshes, where the object is not the point,
+        but a dead end for an orphan vertex_group or shape_key sitting on a
+        single unrigged mesh with no armature to search: "audit_names found
+        it, but not which object" meant a hand-written scan over every mesh's
+        vertex_groups just to locate it, once already, in the field.
+        """
+        vertex_groups, bones, shape_keys = {}, {}, {}
+        for obj in bpy.data.objects:
+            for vgroup in obj.vertex_groups:
+                vertex_groups.setdefault(vgroup.name, []).append(obj.name)
+            data_keys = getattr(obj.data, "shape_keys", None) if obj.data else None
+            if data_keys is not None:
+                for block in data_keys.key_blocks:
+                    shape_keys.setdefault(block.name, []).append(obj.name)
+        for armature in bpy.data.armatures:
+            for bone in armature.bones:
+                bones.setdefault(bone.name, []).append(armature.name)
+        return {"vertex_groups": vertex_groups, "bones": bones,
+               "shape_keys.key_blocks": shape_keys}
+
+    @classmethod
+    def _with_owners(cls, owners_by_name, names):
+        """names, each suffixed " (on: owner, ...)" when it has few enough
+        owners for the list to be a lead rather than noise - see
+        _MAX_ANNOTATED_OWNERS. A name with no recorded owner (should not
+        happen; the caller only passes names this same pass just found) is
+        left bare rather than raising, on the same doesn't-duplicate-a-
+        lookup-contract reasoning as _with_object_types.
+        """
+        result = []
+        for name in names:
+            owners = owners_by_name.get(name, [])
+            if 0 < len(owners) <= cls._MAX_ANNOTATED_OWNERS:
+                result.append(f"{name} (on: {', '.join(sorted(owners))})")
+            else:
+                result.append(name)
+        return result
+
     @command("audit_names")
     def audit_names(self, pattern=None, max_items=50, kind=None, object_name=None):
         """Scan names for a leftover, without changing anything - the whole
@@ -1645,6 +1718,15 @@ class BlenderDevMCPServer:
         (bpy.types.Object.type: MESH, EMPTY, ARMATURE, ...) since that bucket
         is the one place several unrelated kinds of thing share a namespace -
         every other bucket is already homogeneous.
+
+        In a whole-file scan (kind omitted), names in "vertex_groups",
+        "bones" and "shape_keys.key_blocks" are suffixed
+        "(on: object, ...)" when the name has 3 or fewer owners - enough to
+        find an orphan (a vertex_group on one unrigged mesh, say) without a
+        follow-up scan, but not so eagerly that a bone name cascaded across
+        a whole rig's meshes turns into an unreadable owner list. A kind
+        scan (kind="vertex_group"/"bone"/"shape_key" with object_name) never
+        annotates - the owner is already the object_name you passed in.
         """
         if object_name is not None and kind is None:
             raise ValueError(
@@ -1666,6 +1748,7 @@ class BlenderDevMCPServer:
                     "total_matches": len(names)}
 
         snapshot = state.fingerprint()
+        owners = None  # computed at most once, only if a contextual kind matches
         matched, total = {}, 0
         for snap_kind, items in snapshot.items():
             names = sorted({name for name in items.values() if predicate(name)})
@@ -1673,6 +1756,9 @@ class BlenderDevMCPServer:
                 continue
             if snap_kind == "objects":
                 names = self._with_object_types(names)
+            elif snap_kind in ("vertex_groups", "bones", "shape_keys.key_blocks"):
+                owners = owners if owners is not None else self._subitem_owners()
+                names = self._with_owners(owners[snap_kind], names)
             total += len(names)
             matched[snap_kind] = self._audit_entry(names, max_items)
 

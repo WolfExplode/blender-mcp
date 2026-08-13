@@ -2190,8 +2190,10 @@ def test_rename_targets_bone_target_cascade_makes_a_vertex_group_target_redundan
     """Documents the exact interaction the docstring warns about: a
     vertex_group target covering the same rename as a preceding bone target
     finds nothing left to do, because the bone target's cascade already beat
-    it there within this same call - and reports that as "missing", not as
-    a failure.
+    it there within this same call. Its own "applied" count still reads 0,
+    but "original" was applied (by the bone target), so cross-target missing
+    tracking - judged once across every target, not per target - does not
+    also call it "missing": the name was found, just not by this target.
     """
     import bpy
     arm_obj, mesh_obj = _rig_with_vertex_group("__rename_targets_cascade__")
@@ -2207,10 +2209,42 @@ def test_rename_targets_bone_target_cascade_makes_a_vertex_group_target_redundan
         by_kind = {t["kind"]: t for t in result["targets"]}
         assert by_kind["bone"]["applied"] == 1, result
         assert by_kind["vertex_group"]["applied"] == 0, result
-        assert {"kind": "vertex_group", "object_name": mesh_obj.name,
-               "name": "original"} in result["missing"], result
+        assert "missing" not in result, result
     finally:
         _drop_rig("__rename_targets_cascade__")
+
+
+def test_rename_targets_missing_is_judged_once_across_every_target(m):
+    """The friction this exists to remove: a translation dict shared across
+    several unrelated kinds (the documented use case for targets) naturally
+    contains names irrelevant to any one of them. Per-target reporting would
+    call every one of those "missing", burying a genuine typo under noise.
+    Judged once across all targets, only a name absent everywhere earns the
+    label.
+    """
+    import bpy
+    tree = _undo_baseline(m, "__rename_missing_widget__")
+    obj = bpy.data.objects.new("__rename_missing_thing__", None)
+    bpy.context.scene.collection.objects.link(obj)
+    m.undo.reset()
+    bpy.ops.ed.undo_push(message="baseline for targets missing aggregation")
+    try:
+        result = m.BlenderDevMCPServer().rename(
+            targets=[{"kind": "node_group"}, {"kind": "object"}],
+            renames={"__rename_missing_widget__": "__rename_missing_widget_renamed__",
+                    "__rename_missing_thing__": "__rename_missing_thing_renamed__",
+                    "__rename_missing_no_such_name__": "__rename_missing_never_used__"},
+            undo_label="targets rename with one name absent everywhere")
+        assert "__rename_missing_widget_renamed__" in bpy.data.node_groups
+        assert "__rename_missing_thing_renamed__" in bpy.data.objects
+        assert result["missing"] == ["__rename_missing_no_such_name__"], result
+    finally:
+        _drop_tree("__rename_missing_widget__")
+        _drop_tree("__rename_missing_widget_renamed__")
+        for obj_name in ("__rename_missing_thing__", "__rename_missing_thing_renamed__"):
+            o = bpy.data.objects.get(obj_name)
+            if o is not None:
+                bpy.data.objects.remove(o)
 
 
 def test_rename_targets_requires_exactly_one_of_kind_or_targets(m):
@@ -2296,6 +2330,54 @@ def test_audit_names_caps_per_kind_and_reports_the_omitted_count(m):
     finally:
         for obj in made:
             bpy.data.objects.remove(obj)
+
+
+def test_audit_names_whole_file_scan_annotates_a_lightly_shared_subitem_name(m):
+    """The gap a whole-file scan otherwise leaves open: an orphan
+    vertex_group/bone/shape_key match (no armature to search via
+    get_bone_tree, nothing but "audit_names found it") previously had no way
+    to say which object it lives on short of a hand-written scan over every
+    mesh's vertex_groups. Few enough owners (<= _MAX_ANNOTATED_OWNERS) and
+    the report just says so.
+    """
+    import bpy
+    mesh = bpy.data.meshes.new("__audit_owner_mesh__")
+    obj = bpy.data.objects.new("__audit_owner_obj__", mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    obj.vertex_groups.new(name="首")
+    try:
+        result = m.BlenderDevMCPServer().audit_names()
+        names = result["matched"]["vertex_groups"]["names"]
+        assert f"首 (on: {obj.name})" in names, names
+    finally:
+        bpy.data.objects.remove(obj)
+        bpy.data.meshes.remove(mesh)
+
+
+def test_audit_names_whole_file_scan_leaves_a_widely_shared_subitem_name_bare(m):
+    """The other half of the same fix: a bone name cascaded across a rig's
+    meshes (the ordinary case, not the orphan one) has every mesh as an
+    owner - annotating all of them would turn one dedup'd match back into an
+    unreadable list, exactly what the whole-file scan's dedup exists to
+    avoid. Past _MAX_ANNOTATED_OWNERS owners, the name is left bare.
+    """
+    import bpy
+    made = []
+    for i in range(m.BlenderDevMCPServer._MAX_ANNOTATED_OWNERS + 1):
+        mesh = bpy.data.meshes.new(f"__audit_owner_shared_mesh_{i}__")
+        obj = bpy.data.objects.new(f"__audit_owner_shared_obj_{i}__", mesh)
+        bpy.context.scene.collection.objects.link(obj)
+        obj.vertex_groups.new(name="首")
+        made.append((obj, mesh))
+    try:
+        result = m.BlenderDevMCPServer().audit_names()
+        names = result["matched"]["vertex_groups"]["names"]
+        assert "首" in names, names
+        assert not any(n.startswith("首 (on:") for n in names), names
+    finally:
+        for obj, mesh in made:
+            bpy.data.objects.remove(obj)
+            bpy.data.meshes.remove(mesh)
 
 
 def main():
