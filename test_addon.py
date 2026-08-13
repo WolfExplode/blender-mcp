@@ -28,6 +28,8 @@ class FakeClient:
     def __init__(self, chunks):
         self._chunks = list(chunks)
         self.sent = []
+        self.closed = False
+        self.shutdown_called = False
 
     def recv(self, _size):
         return self._chunks.pop(0) if self._chunks else b""
@@ -38,8 +40,11 @@ class FakeClient:
     def settimeout(self, _t):
         pass
 
+    def shutdown(self, _how):
+        self.shutdown_called = True
+
     def close(self):
-        pass
+        self.closed = True
 
 
 def _drain(m, chunks):
@@ -110,6 +115,107 @@ def test_oversized_buffer_is_discarded(m):
     server._handle_client(FakeClient([b'{"junk": ' + b"x" * 200,
                                       b'{"type": "after"}']))
     assert [c["type"] for c in seen] == ["after"], seen
+
+
+# ---------------------------------------------------------------- lifecycle
+# Reloading an addon calls unregister() -> stop(). Before these guards, that
+# closed only the listening socket: pooled client sockets stayed open, looked
+# healthy to the MCP client, and swallowed one command each -- executing it on
+# a dead server instance and sending the reply nowhere.
+
+def test_stop_hangs_up_on_accepted_clients(m):
+    server = m.BlenderDevMCPServer()
+    server.running = True
+    clients = [FakeClient([]), FakeClient([])]
+    server._clients.update(clients)
+
+    server.stop()
+
+    for client in clients:
+        assert client.shutdown_called, "peer must be told, not just our handle closed"
+        assert client.closed, "accepted sockets must be closed by stop()"
+    assert not server._clients, "the client set must be emptied"
+
+
+def test_handler_deregisters_its_client_on_exit(m):
+    # Otherwise the set grows for the life of the session and stop() would
+    # shutdown() sockets that closed long ago.
+    server = m.BlenderDevMCPServer()
+    server.running = True
+    server._dispatch_on_main_thread = lambda client, command: None
+    client = FakeClient([b'{"type": "get_scene_info"}'])
+    server._clients.add(client)
+
+    server._handle_client(client)
+
+    assert not server._clients, "handler must remove its own client when it exits"
+
+
+def test_command_arriving_after_stop_is_not_executed(m):
+    # The handler thread sits blocked in recv() across the stop, so `running`
+    # has to be re-checked after the read, not only at the top of the loop.
+    server = m.BlenderDevMCPServer()
+    server.running = True
+    seen = []
+    server._dispatch_on_main_thread = lambda client, command: seen.append(command)
+
+    class StopsMidRecv(FakeClient):
+        def recv(self, size):
+            server.running = False  # stop() lands while we are blocked here
+            return super().recv(size)
+
+    server._handle_client(StopsMidRecv([b'{"type": "execute_code"}']))
+
+    assert seen == [], "a stopped server must not execute what it happens to read"
+
+
+def test_queued_command_is_discarded_if_the_server_stopped(m):
+    # execute_command runs on a main-thread timer, so stop() can land between
+    # queueing and firing. Running then would mutate the blend file for a client
+    # that has already been hung up on.
+    import bpy
+
+    server = m.BlenderDevMCPServer()
+    server.running = True
+    ran = []
+    server.execute_command = lambda command: ran.append(command) or {"status": "success"}
+
+    queued = []
+    real_register = bpy.app.timers.register
+    bpy.app.timers.register = lambda fn, **kw: queued.append(fn)
+    try:
+        client = FakeClient([])
+        server._dispatch_on_main_thread(client, {"type": "execute_code", "params": {}})
+    finally:
+        bpy.app.timers.register = real_register
+
+    assert queued, "expected the command to be queued on a timer"
+    server.running = False
+    queued[0]()
+
+    assert ran == [], "a command queued by a now-stopped server must not run"
+    assert client.sent == [], "and nothing should be written to the closed client"
+
+
+def test_queued_command_still_runs_while_the_server_is_up(m):
+    # Guard against the check above turning into a blanket "never dispatch".
+    import bpy
+
+    server = m.BlenderDevMCPServer()
+    server.running = True
+    ran = []
+    server.execute_command = lambda command: ran.append(command) or {"status": "success"}
+
+    queued = []
+    real_register = bpy.app.timers.register
+    bpy.app.timers.register = lambda fn, **kw: queued.append(fn)
+    try:
+        server._dispatch_on_main_thread(FakeClient([]), {"type": "get_scene_info"})
+    finally:
+        bpy.app.timers.register = real_register
+
+    queued[0]()
+    assert [c["type"] for c in ran] == ["get_scene_info"], ran
 
 
 # ---------------------------------------------------------------- dispatch
@@ -282,6 +388,10 @@ def test_tee_is_idempotent(m):
 
 def test_register_cycle(m):
     import bpy
+    # Patch on the class, so restore it on the way out: these used to leak, and
+    # every later test that exercised the real start/stop was silently running
+    # against a no-op lambda instead.
+    real_start, real_stop = m.BlenderDevMCPServer.start, m.BlenderDevMCPServer.stop
     m.BlenderDevMCPServer.start = lambda self: None  # never bind a real port
     m.BlenderDevMCPServer.stop = lambda self: None
     m.register()
@@ -295,6 +405,7 @@ def test_register_cycle(m):
             "bl_idname must equal the addon module name or Blender cannot find the prefs"
     finally:
         m.unregister()
+        m.BlenderDevMCPServer.start, m.BlenderDevMCPServer.stop = real_start, real_stop
     assert not isinstance(sys.stderr, m._StderrTee), "unregister did not restore stderr"
     assert "BLENDERDEVMCP_PT_Panel" not in dir(bpy.types), "panel leaked"
     # The old Scene properties must not come back - they were the bug.
@@ -310,6 +421,7 @@ def test_settings_are_not_stored_on_the_scene(m):
     silently ignored on every launch.
     """
     import bpy
+    real_start, real_stop = m.BlenderDevMCPServer.start, m.BlenderDevMCPServer.stop
     m.BlenderDevMCPServer.start = lambda self: None
     m.BlenderDevMCPServer.stop = lambda self: None
     m.register()
@@ -321,6 +433,7 @@ def test_settings_are_not_stored_on_the_scene(m):
         assert "port" in annotations and "auto_start" in annotations, annotations
     finally:
         m.unregister()
+        m.BlenderDevMCPServer.start, m.BlenderDevMCPServer.stop = real_start, real_stop
 
 
 def test_get_prefs_returns_none_when_addon_is_not_installed(m):

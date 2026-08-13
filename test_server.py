@@ -9,11 +9,15 @@ import json
 import os
 import socket
 import sys
+import threading
 import time
+from contextlib import suppress
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
-from blender_dev_mcp.server import BlenderConnection  # noqa: E402
+from blender_dev_mcp.server import (  # noqa: E402
+    BlenderConnection, IncompleteResponse, NotConnected, READ_ONLY_COMMANDS,
+)
 
 
 class FakeSocket:
@@ -94,7 +98,11 @@ def test_closed_connection_before_any_data_raises():
     conn = _conn([])
     try:
         conn.receive_full_response(conn.sock)
-    except Exception as exc:
+    except IncompleteResponse as exc:
+        # Must be IncompleteResponse specifically, not a bare Exception: only
+        # then does _attempt classify it as a transport failure and drop the
+        # socket. As a bare Exception it escaped uncaught and the dead socket
+        # stayed pooled, costing an extra failed call before recovery.
         assert "closed" in str(exc).lower(), exc
         return
     raise AssertionError("expected an error when the peer closes immediately")
@@ -192,7 +200,7 @@ def test_connect_failure_names_the_address():
     srv._blender_connection = None
     os.environ["BLENDER_PORT"] = "9999"  # nothing listens here
     try:
-        srv.get_blender_connection()
+        srv.get_blender_connection().send_command("get_scene_info")
     except Exception as exc:
         assert "9999" in str(exc), f"error should name the port it tried: {exc}"
         return
@@ -202,7 +210,266 @@ def test_connect_failure_names_the_address():
             os.environ.pop("BLENDER_PORT", None)
         else:
             os.environ["BLENDER_PORT"] = saved_port
-    raise AssertionError("connecting to a dead port should raise")
+    raise AssertionError("commanding a dead port should raise")
+
+
+def test_unreachable_blender_is_not_reported_as_a_lost_connection():
+    conn = BlenderConnection(host="127.0.0.1", port=9999)  # nothing listens here
+    try:
+        conn.send_command("get_scene_info")
+    except NotConnected as exc:
+        assert "lost" not in str(exc).lower(), \
+            f"a connection that never existed was not 'lost': {exc}"
+        return
+    raise AssertionError("expected NotConnected")
+
+
+# ------------------------------------------------- stale pooled socket recovery
+
+class StaleThenLiveConnection(BlenderConnection):
+    """Pools a socket whose peer has already hung up, then reconnects to a live one.
+
+    Models the real failure: reloading addons in Blender restarts the companion
+    server and orphans every pooled socket, which still looks healthy until
+    something is written to it.
+    """
+
+    def __init__(self, live_chunks, **kw):
+        super().__init__(host="test", port=0, **kw)
+        self._live_chunks = live_chunks
+        self.connects = 0
+        self.sock = FakeSocket([])  # recv returns b"" -> peer already gone
+
+    def connect(self):
+        self.connects += 1
+        self.sock = FakeSocket(list(self._live_chunks))
+        return True
+
+
+def test_stale_pooled_socket_is_replaced_and_the_read_is_retried():
+    conn = StaleThenLiveConnection([b'{"status": "success", "result": {"name": "Scene"}}'])
+    assert conn.send_command("get_scene_info") == {"name": "Scene"}
+    assert conn.connects == 1, "should have reconnected exactly once"
+
+
+def test_stale_socket_retry_is_transparent_to_the_caller():
+    # The whole point: one dead pooled socket must not surface as a tool error.
+    conn = StaleThenLiveConnection([b'{"status": "success", "result": {"ok": 1}}'])
+    conn.send_command("get_object_info", {"name": "Cube"})
+    sent = json.loads(conn.sock.sent[0])
+    assert sent == {"type": "get_object_info", "params": {"name": "Cube"}}, sent
+
+
+def test_mutating_command_is_not_replayed_on_a_stale_socket():
+    # Replaying execute_code could apply the same edit twice, because a dead
+    # socket cannot prove whether Blender ran the command before hanging up.
+    conn = StaleThenLiveConnection([b'{"status": "success", "result": {}}'])
+    try:
+        conn.send_command("execute_code", {"code": "bpy.ops.mesh.primitive_cube_add()"})
+    except Exception as exc:
+        assert conn.connects == 0, "a mutating command must not be retried"
+        assert "not retried automatically" in str(exc), exc
+        return
+    raise AssertionError("expected a mutating command to refuse the replay")
+
+
+def test_retry_happens_only_once():
+    class AlwaysStale(StaleThenLiveConnection):
+        def connect(self):
+            self.connects += 1
+            self.sock = FakeSocket([])  # still dead
+            return True
+
+    conn = AlwaysStale([])
+    try:
+        conn.send_command("get_scene_info")
+    except Exception as exc:
+        assert conn.connects == 1, f"expected one retry, got {conn.connects}"
+        assert "lost" in str(exc).lower(), exc
+        return
+    raise AssertionError("expected the second failure to surface")
+
+
+def test_fresh_connection_failure_is_not_retried():
+    # sock is None, so the very first attempt is already on a new socket.
+    # Retrying that would just double every genuine outage.
+    class CountingConnect(BlenderConnection):
+        def __init__(self):
+            super().__init__(host="test", port=0)
+            self.connects = 0
+
+        def connect(self):
+            self.connects += 1
+            self.sock = FakeSocket([])
+            return True
+
+    conn = CountingConnect()
+    try:
+        conn.send_command("get_scene_info")
+    except Exception:
+        assert conn.connects == 1, f"expected no retry, got {conn.connects} connects"
+        return
+    raise AssertionError("expected the failure to surface")
+
+
+def test_oserror_family_is_treated_as_a_dropped_socket():
+    # WSAECONNABORTED (10053) arrives as a plain OSError on Windows and used to
+    # slip past a handler that only listed ConnectionError/BrokenPipe/Reset.
+    class AbortingSocket(FakeSocket):
+        def sendall(self, _data):
+            raise OSError(10053, "An established connection was aborted")
+
+    conn = BlenderConnection(host="test", port=0)
+    conn.sock = AbortingSocket([])
+    try:
+        conn.send_command("get_scene_info")
+    except Exception:
+        assert conn.sock is None, "an aborted socket must be dropped, not pooled"
+        return
+    raise AssertionError("expected an error")
+
+
+def test_error_status_keeps_the_socket_pooled():
+    # A well-formed {"status": "error"} means the transport is healthy; dropping
+    # the socket would force a needless reconnect on every Blender-side error.
+    conn = _conn([b'{"status": "error", "message": "no such object"}'])
+    try:
+        conn.send_command("get_object_info", {"name": "nope"})
+    except Exception:
+        assert conn.sock is not None, "a Blender-side error must not drop the socket"
+        return
+    raise AssertionError("an error status should raise")
+
+
+def test_read_only_set_covers_only_side_effect_free_commands():
+    mutating = {"execute_code", "undo_edit", "restore_node_snapshot",
+                "annotate_node_tree", "snapshot_node_tree"}
+    overlap = mutating & READ_ONLY_COMMANDS
+    assert not overlap, f"these mutate and must never be auto-replayed: {overlap}"
+
+
+# ------------------------------------- integration: real sockets, real restart
+
+class FakeAddon:
+    """The addon's socket server, reduced to its lifecycle over a real socket.
+
+    Mirrors the fixed addon: stop() hangs up on accepted connections instead of
+    leaving them open, and a handler that wakes to find the server stopped does
+    not execute what it read.
+    """
+
+    def __init__(self):
+        self.port = 0
+        self.running = False
+        self.served = []
+        self._listener = None
+        self._clients = []
+
+    def start(self):
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", self.port))
+        self.port = self._listener.getsockname()[1]  # keep it across restarts
+        self._listener.listen(5)
+        self.running = True
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        self._listener.settimeout(0.25)
+        while self.running:
+            try:
+                client, _addr = self._listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            self._clients.append(client)
+            threading.Thread(target=self._serve, args=(client,), daemon=True).start()
+
+    def _serve(self, client):
+        while self.running:
+            try:
+                data = client.recv(8192)
+            except OSError:
+                break
+            if not data or not self.running:
+                break
+            command = json.loads(data.decode("utf-8"))
+            self.served.append(command["type"])
+            with suppress(OSError):
+                client.sendall(json.dumps(
+                    {"status": "success", "result": {"ok": command["type"]}}
+                ).encode("utf-8"))
+
+    def stop(self):
+        self.running = False
+        for client in self._clients:
+            with suppress(OSError):
+                client.shutdown(socket.SHUT_RDWR)
+            with suppress(OSError):
+                client.close()
+        self._clients = []
+        with suppress(OSError):
+            self._listener.close()
+
+
+def test_client_survives_an_addon_restart():
+    """The bug this whole path exists for: reloading addons in Blender used to
+    surface as two failed tool calls before anything worked again."""
+    addon = FakeAddon()
+    addon.start()
+    try:
+        conn = BlenderConnection(host="127.0.0.1", port=addon.port)
+        assert conn.send_command("get_scene_info") == {"ok": "get_scene_info"}
+
+        addon.stop()          # unregister()
+        addon.start()         # register(), same port
+        time.sleep(0.05)      # let the listener come up
+
+        # No reconnect dance from the caller: this must just work.
+        assert conn.send_command("get_scene_info") == {"ok": "get_scene_info"}
+        assert addon.served == ["get_scene_info", "get_scene_info"], addon.served
+    finally:
+        addon.stop()
+
+
+def test_mutating_command_is_not_replayed_across_an_addon_restart():
+    addon = FakeAddon()
+    addon.start()
+    try:
+        conn = BlenderConnection(host="127.0.0.1", port=addon.port)
+        conn.send_command("get_scene_info")
+
+        addon.stop()
+        addon.start()
+        time.sleep(0.05)
+
+        try:
+            conn.send_command("execute_code", {"code": "bpy.ops.object.delete()"})
+        except Exception as exc:
+            assert "not retried automatically" in str(exc), exc
+            assert "execute_code" not in addon.served, \
+                "a delete must never be replayed onto a reconnected Blender"
+            return
+        raise AssertionError("expected the mutating command to refuse the replay")
+    finally:
+        addon.stop()
+
+
+def test_blender_going_away_entirely_is_reported():
+    addon = FakeAddon()
+    addon.start()
+    conn = BlenderConnection(host="127.0.0.1", port=addon.port)
+    conn.send_command("get_scene_info")
+    addon.stop()  # and never comes back
+
+    try:
+        conn.send_command("get_scene_info")
+    except Exception as exc:
+        assert "9" in str(exc) or "connect" in str(exc).lower(), exc
+        assert conn.sock is None, "no dead socket may be left pooled"
+        return
+    raise AssertionError("expected an error once Blender is gone")
 
 
 def main():

@@ -42,6 +42,42 @@ class IncompleteResponse(Exception):
     """
 
 
+class ConnectionDropped(Exception):
+    """The socket failed mid-exchange and has been discarded.
+
+    Raised for every transport-level failure -- reset, aborted, closed early,
+    truncated. The distinction that matters to the caller is not which of those
+    happened but that no trustworthy reply arrived and the stream is gone.
+    """
+
+
+class NotConnected(ConnectionDropped):
+    """No connection could be established in the first place.
+
+    A subclass because the recovery is identical -- there is no usable socket
+    either way -- but the wording must not blame a connection that never
+    existed, and the address has to be named: the port is settable both in the
+    addon panel and via BLENDER_PORT, so a bare "refused" is ambiguous between
+    "Blender is closed" and "the two ends disagree on the port".
+    """
+
+
+# Commands with no effect on the blend file or on disk. Only these may be
+# replayed automatically when a pooled socket turns out to be dead: a stale
+# socket cannot prove whether the command reached Blender before the connection
+# went away, and replaying a mutating command could apply it twice.
+READ_ONLY_COMMANDS = frozenset({
+    "get_scene_info",
+    "get_object_info",
+    "get_viewport_screenshot",
+    "get_stderr_log",
+    "list_node_trees",
+    "get_node_tree_outline",
+    "get_node_detail",
+    "validate_node_tree",
+})
+
+
 @dataclass
 class BlenderConnection:
     host: str
@@ -82,7 +118,13 @@ class BlenderConnection:
             chunk = sock.recv(buffer_size)
             if not chunk:
                 if not chunks:
-                    raise Exception("Connection closed before receiving any data")
+                    # Raise the same type as a truncated reply. This used to be a
+                    # bare Exception, which matched none of the handlers in
+                    # _attempt and so escaped with the dead socket still cached --
+                    # every pooled-socket death then cost two failed calls instead
+                    # of being retried transparently.
+                    raise IncompleteResponse(
+                        "connection closed before any data arrived")
                 break
             chunks.append(chunk)
             data = b"".join(chunks)
@@ -112,8 +154,50 @@ class BlenderConnection:
             return self._send_command_locked(command_type, params)
 
     def _send_command_locked(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Send one command, replacing a pooled socket that turns out to be dead.
+
+        A socket handed back by the pool may have been closed by the peer since
+        it was last used: reloading addons in Blender restarts the companion
+        server and orphans every open connection. Nothing distinguishes that
+        from a healthy socket until something is written to it, so the first
+        attempt doubles as the liveness probe and a failure on a *reused* socket
+        is treated as routine rather than as an error worth surfacing.
+        """
+        pooled = self.sock is not None
+        try:
+            return self._attempt(command_type, params)
+        except NotConnected:
+            raise
+        except ConnectionDropped as exc:
+            if not pooled:
+                # Freshly connected and it still failed - Blender itself is the
+                # problem, so reporting beats retrying.
+                raise Exception(f"Connection to Blender lost: {exc}") from exc
+            if command_type not in READ_ONLY_COMMANDS:
+                raise Exception(
+                    f"Connection to Blender was dropped before '{command_type}' "
+                    f"was answered ({exc}). It may or may not have run, so it "
+                    "was not retried automatically - check the result and "
+                    "re-issue it if nothing happened."
+                ) from exc
+            logger.info("Pooled socket was stale; reconnecting to retry %s",
+                        command_type)
+
+        # Second and final attempt, on a socket known to be new.
+        try:
+            return self._attempt(command_type, params)
+        except NotConnected:
+            raise
+        except ConnectionDropped as exc:
+            raise Exception(f"Connection to Blender lost: {exc}") from exc
+
+    def _attempt(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
+        """One send/receive round trip. Any transport failure drops the socket."""
         if not self.sock and not self.connect():
-            raise ConnectionError("Not connected to Blender")
+            raise NotConnected(
+                f"Could not connect to Blender at {self.host}:{self.port}. Make "
+                "sure Blender is running with the Blender Dev MCP addon enabled, "
+                "and that the port matches the one in View3D > Sidebar > Dev MCP.")
 
         command = {"type": command_type, "params": params or {}}
         try:
@@ -122,61 +206,62 @@ class BlenderConnection:
             self.sock.settimeout(RECV_TIMEOUT)
             response = json.loads(
                 self.receive_full_response(self.sock).decode("utf-8"))
-
-            if response.get("status") == "error":
-                raise Exception(response.get("message", "Unknown error from Blender"))
-            return response.get("result", {})
-
         except socket.timeout:
-            # Invalidate the socket so the next call reconnects.
-            self.sock = None
+            # socket.timeout is an OSError, so it has to be classified before
+            # the transport catch-all below. A timeout is not a dead socket -
+            # Blender may simply be busy - but the stream is desynced either
+            # way, so the socket still goes.
+            self.disconnect()
             raise Exception(
                 f"Timeout after {RECV_TIMEOUT:g}s waiting for Blender. If Blender "
                 "is running headless (blender -b), commands never execute - run "
                 "it with a GUI. If the command is genuinely slow, raise "
                 "BLENDER_MCP_TIMEOUT (seconds).")
-        except (ConnectionError, BrokenPipeError, ConnectionResetError) as exc:
-            self.sock = None
-            raise Exception(f"Connection to Blender lost: {exc}")
         except json.JSONDecodeError as exc:
-            self.sock = None
-            raise Exception(f"Invalid response from Blender: {exc}")
-        except IncompleteResponse as exc:
-            # Previously this escaped uncaught, leaving self.sock in place. The
-            # stream was already desynced, so every later command read the
-            # wrong reply until the process restarted.
-            self.sock = None
-            raise Exception(f"Truncated response from Blender: {exc}")
+            self.disconnect()
+            raise Exception(f"Invalid response from Blender: {exc}") from exc
+        except (OSError, IncompleteResponse) as exc:
+            # Every transport failure lands here: refused, reset, aborted, closed
+            # early, truncated. OSError covers the whole errno family, so a new
+            # platform-specific code cannot slip through uncaught and leave a
+            # dead socket in the pool the way WSAECONNABORTED once did.
+            self.disconnect()
+            raise ConnectionDropped(str(exc) or type(exc).__name__) from exc
+        except Exception:
+            # Unclassified, so the stream state is unknown - never reuse it.
+            self.disconnect()
+            raise
+
+        # Deliberately outside the try: a well-formed error reply means the
+        # connection is healthy and should stay in the pool.
+        if response.get("status") == "error":
+            raise Exception(response.get("message", "Unknown error from Blender"))
+        return response.get("result", {})
 
 
 _blender_connection = None
 
 
 def get_blender_connection() -> BlenderConnection:
-    """Get or create the persistent Blender connection."""
-    global _blender_connection
+    """Get the persistent Blender connection, creating the pool entry if needed.
 
-    # Reuse the existing connection. We deliberately do NOT probe it with a
-    # command here: that put two commands on the wire for every tool call, and
-    # any overlap desynced the response stream until the socket timeout fired.
-    # A dead socket is detected by the next real command and reconnected then.
-    if _blender_connection is not None and _blender_connection.sock is not None:
-        return _blender_connection
+    Connecting is left to the first command. We deliberately do NOT probe the
+    socket here: that put two commands on the wire for every tool call, and any
+    overlap desynced the response stream until the socket timeout fired. A dead
+    socket is detected by the next real command and replaced there, which is
+    also the only place that knows whether the command is safe to replay.
+    """
+    global _blender_connection
 
     if _blender_connection is None:
         host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
         port = int(os.getenv("BLENDER_PORT", DEFAULT_PORT))
         _blender_connection = BlenderConnection(host=host, port=port)
-        if not _blender_connection.connect():
-            _blender_connection = None
-            # Name the address: the port is settable both in the addon panel and
-            # via BLENDER_PORT, so "refused" is otherwise ambiguous between
-            # "Blender is closed" and "the two ends disagree on the port".
-            raise Exception(
-                f"Could not connect to Blender at {host}:{port}. Make sure "
-                "Blender is running with the Blender Dev MCP addon enabled, and "
-                "that the port matches the one in View3D > Sidebar > Dev MCP.")
-        logger.info("Created new persistent connection to Blender")
+        # Connect eagerly so startup can log reachability, but a failure here is
+        # not fatal: Blender may simply not be up yet, and _attempt will name the
+        # address if it is still unreachable when a command needs it.
+        if _blender_connection.connect():
+            logger.info("Created new persistent connection to Blender")
 
     return _blender_connection
 

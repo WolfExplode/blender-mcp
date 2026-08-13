@@ -109,6 +109,11 @@ class BlenderDevMCPServer:
         self.running = False
         self.socket = None
         self.server_thread = None
+        # Accepted connections, so stop() can hang up on them. Reloading addons
+        # calls unregister() -> stop(), and a client that is not told about that
+        # keeps a socket it believes is live.
+        self._clients = set()
+        self._clients_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -146,6 +151,23 @@ class BlenderDevMCPServer:
                 self.socket.close()
             self.socket = None
 
+        # Hang up on accepted connections too, not just the listener. A client
+        # sitting in recv() would otherwise never learn the server went away: it
+        # keeps a socket that looks healthy, and its next command arrives at a
+        # handler thread belonging to a dead server. Closing here turns "reload
+        # the addon" into an immediate, unambiguous disconnect.
+        with self._clients_lock:
+            clients, self._clients = list(self._clients), set()
+        for client in clients:
+            # shutdown() first: close() alone only drops this process's handle,
+            # so a peer blocked in recv() would wait for a FIN that never comes.
+            with suppress(Exception):
+                client.shutdown(socket.SHUT_RDWR)
+            with suppress(Exception):
+                client.close()
+        if clients:
+            print(f"BlenderDevMCP: closed {len(clients)} client connection(s)")
+
         if self.server_thread:
             with suppress(Exception):
                 if self.server_thread.is_alive():
@@ -160,6 +182,8 @@ class BlenderDevMCPServer:
             try:
                 client, address = self.socket.accept()
                 print(f"BlenderDevMCP: client connected from {address}")
+                with self._clients_lock:
+                    self._clients.add(client)
                 threading.Thread(
                     target=self._handle_client, args=(client,), daemon=True
                 ).start()
@@ -180,6 +204,13 @@ class BlenderDevMCPServer:
             while self.running:
                 data = client.recv(8192)
                 if not data:
+                    break
+                if not self.running:
+                    # Stopped while this thread sat in recv(). Executing now
+                    # would run a command on behalf of a server that no longer
+                    # exists - and after an addon reload a second, live server
+                    # owns the port, so the client would get one command silently
+                    # handled by the old instance with the reply going nowhere.
                     break
                 buffer += data
 
@@ -218,6 +249,8 @@ class BlenderDevMCPServer:
         except Exception as exc:
             print(f"BlenderDevMCP: client handler error - {exc}")
         finally:
+            with self._clients_lock:
+                self._clients.discard(client)
             with suppress(Exception):
                 client.close()
 
@@ -237,6 +270,14 @@ class BlenderDevMCPServer:
         """Queue a command for Blender's main thread and reply when it is done."""
 
         def run():
+            # The timer fires on the main thread some time after queueing, and
+            # stop() can land in that gap. Running anyway would mutate the blend
+            # file on behalf of a server the client has already been hung up on,
+            # with nowhere to send the result.
+            if not self.running:
+                print("BlenderDevMCP: server stopped before "
+                      f"{command.get('type')!r} ran - discarded")
+                return None
             try:
                 response = self.execute_command(command)
             except Exception as exc:
