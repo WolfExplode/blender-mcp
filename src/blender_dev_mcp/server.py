@@ -339,50 +339,37 @@ def execute_blender_code(ctx: Context, code: str, undo_label: str = None,
     Captures stdout and stderr. If the code raises, the error includes both the
     output produced before the exception and the full traceback.
 
-    This is the general-purpose tool here, and deliberately so: the read tools
-    answer fixed questions, and anything else is a few lines of bpy. Reach for
-    it freely to read.
-
-    Every labelled write - dry run or not - reports what it created, deleted
-    and renamed, so the blast radius of an edit is always visible rather than
-    something to ask for separately.
+    The general-purpose tool here - read tools answer fixed questions, anything
+    else is a few lines of bpy. A labelled write (dry run or not) also reports
+    what it created, deleted and renamed.
 
     Parameters:
-    - code: Python source to execute. `bpy`, `bmesh`, `mathutils` and `math`
-      are already in scope. Runs with __name__ set to "<blender_dev_mcp>", so an
-      `if __name__ == "__main__"` block will not fire on its own.
-    - undo_label: Set this whenever the code changes anything, to a short
-      description of the change ("add curve resample", "relink noise input").
-      It registers the edit as one step, which makes it a single Ctrl-Z for the
-      user and lets undo_edit take it back. Leave it unset for code that only
-      reads - an unlabelled edit cannot be undone through this tooling, and its
-      diff is not fingerprinted at all.
-    - dry_run: For when you might not go through with the edit. The code still
-      runs for real - there is no way to preview arbitrary Python other than
-      doing it - but the file is put back afterwards, so nothing in it is kept.
-      Reach for this when the scope is the unknown: an operator with implicit
-      reach, a wildcard name match, someone else's rig. Skip it for an edit
-      whose extent you already know from the code - a plain labelled write
-      reports the same diff without a second, wasted execution. It cannot take
-      back writes outside the blend file: a save, export or network call inside
-      dry-run code already happened for real, and undo cannot touch it.
+    - code: Python source. `bpy`, `bmesh`, `mathutils`, `math` already in scope.
+      Runs with __name__ = "<blender_dev_mcp>", so `if __name__ == "__main__"`
+      won't fire on its own.
+    - undo_label: Set whenever the code changes anything, to a short
+      description ("add curve resample"). Makes the edit one Ctrl-Z and lets
+      undo_edit take it back, and fingerprints the diff. Leave unset for
+      read-only code - an unlabelled edit can't be undone or diffed.
+    - dry_run: Runs for real (no way to preview arbitrary Python otherwise) then
+      puts the file back, keeping nothing. Use when the scope is unknown - an
+      operator with implicit reach, a wildcard match, someone else's rig. Skip
+      it when you already know the extent - a plain labelled write reports the
+      same diff without a second execution. Can't undo writes outside the blend
+      file (saves, exports, network calls already happened for real).
     - rollback_on_error: When labelled code raises partway, take back what it
-      already did (default true). Turn it off only to inspect the wreckage of a
-      half-applied edit.
-    - max_diff_items: Cap on entries listed per change kind (default 100; 0 for
-      no cap). High enough that hand-authored edits are never cut. Past the cap
-      you get a head-and-tail sample rather than the first N, because the lists
-      are name-sorted and the unexpected entry is as likely to sort last as
-      first. The full counts are always reported under "totals".
+      already did (default true). False keeps the wreckage for inspection.
+    - max_diff_items: Cap per change kind (default 100, 0 = no cap). Past the
+      cap you get a head-and-tail sample, not the first N, since lists are
+      name-sorted and an outlier is as likely to sort last as first. Full
+      counts always in "totals".
 
-    The diff has its own blind spots regardless of dry_run: it compares names
-    and existence only, so a pure value assignment shows as no change; and it
-    watches bpy.data plus vertex groups, bones and shape keys, so state an
-    addon keeps in its own PropertyGroup collections (mmd_root.vertex_morphs,
-    rig metadata, modifier settings) is invisible - and when an addon binds its
-    records to datablocks *by name*, a rename is exactly the edit whose risky
-    half will not appear. Print the post-state yourself for anything the diff
-    cannot see.
+    Diff blind spots regardless of dry_run: compares names/existence only, so
+    a value assignment shows as no change; only watches bpy.data plus vertex
+    groups, bones, shape keys, so addon-owned PropertyGroup state (rig
+    metadata, custom collections) is invisible, and if that state is keyed by
+    datablock name, a rename is the risky edit that won't show. Print
+    post-state yourself for anything the diff can't see.
     """
     result = get_blender_connection().send_command(
         "execute_code", {"code": code, "undo_label": undo_label,
@@ -426,27 +413,26 @@ def execute_blender_code(ctx: Context, code: str, undo_label: str = None,
 def undo_edit(ctx: Context, steps: int = 1, all_steps: bool = False) -> str:
     """Take back edits this session made to the blend file, in place.
 
-    This is the reverse gear, and restore_node_snapshot is not: undo puts a
-    tree back as it was, keeping the identity that objects and modifier inputs
-    are bound to. Restoring builds a copy alongside, and repointing modifiers
-    at that copy resets their saved values.
+    The reverse gear, and restore_node_snapshot is not: undo puts a tree back
+    as it was, keeping the identity objects and modifier inputs are bound to.
+    Restoring builds a copy alongside, and repointing modifiers at it resets
+    their saved values.
 
     Only steps this MCP session pushed can be taken back - it refuses rather
-    than eating edits made in Blender itself. So it can undo an
-    annotate_node_tree, a restore_node_snapshot, or an execute_blender_code
-    that carried an undo_label, but never the user's own work.
+    than eating edits made in Blender itself. Can undo an annotate_node_tree,
+    a restore_node_snapshot, or a labelled execute_blender_code, never the
+    user's own work.
 
-    Targeting is only exact if you undo directly after writing. If the user
-    edits in Blender in between, theirs is the more recent step and it comes
-    off first. Re-read any tree afterwards rather than trusting an earlier read.
+    Targeting is exact only right after writing - if the user edits in Blender
+    first, theirs is the more recent step and comes off first. Re-read any tree
+    afterwards rather than trusting an earlier read.
 
     Parameters:
     - steps: How many steps to take back. Defaults to 1, the last write.
-    - all_steps: Take back everything this session pushed and still owns,
-      ignoring `steps`. The escape hatch after a bulk edit spread over several
-      calls, where undoing by hand means knowing what each call contributed and
-      guessing low leaves the file half-reverted. The targeting caveat above
-      applies more strongly the further back it walks.
+    - all_steps: Take back everything this session still owns, ignoring
+      `steps`. Escape hatch after a bulk edit spread over several calls, where
+      undoing by hand means knowing what each call contributed. Same targeting
+      caveat, more so the further back it walks.
     """
     result = get_blender_connection().send_command(
         "undo_edit", {"steps": steps, "all_steps": all_steps})
