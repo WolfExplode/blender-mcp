@@ -72,6 +72,7 @@ class NotConnected(ConnectionDropped):
 READ_ONLY_COMMANDS = frozenset({
     "get_scene_info",
     "get_object_info",
+    "get_object_property",
     "get_viewport_screenshot",
     "get_stderr_log",
     "list_node_trees",
@@ -418,6 +419,37 @@ def get_object_info(ctx: Context, object_name: str, max_items: int = 40) -> str:
     result = get_blender_connection().send_command(
         "get_object_info", {"name": object_name, "max_items": max_items})
     return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def get_object_property(ctx: Context, object_name: str, path: str,
+                        max_items: int = 40) -> str:
+    """Read one specific piece of data hanging off an object by RNA path.
+
+    get_object_info answers fixed, shallow questions (what shape keys exist,
+    how many modifiers) - names and counts only. This drills into one of
+    them: a shape key's value/mute/interpolation, a modifier's actual
+    settings, a constraint's target and influence. It is the same
+    outline-then-detail shape as get_node_tree_outline/get_node_detail,
+    applied to the rest of an object's data instead of just geometry nodes.
+
+    A datablock reached along the path (a material, another object, a mesh)
+    is named rather than expanded - point a fresh call at it if you need its
+    own detail. A nested struct one level deep is fully expanded; a
+    collection reached mid-path or as the result is a capped list of names.
+
+    Parameters:
+    - object_name: Object to start from (see get_object_info)
+    - path: Dotted path from the object, e.g. 'modifiers["Subsurf"]',
+      'data.shape_keys.key_blocks["Smile"]', 'constraints[0]',
+      'data.shape_keys.key_blocks["Smile"].value'
+    - max_items: Cap on names listed for any collection along the way
+      (default 40; 0 for all)
+    """
+    result = get_blender_connection().send_command(
+        "get_object_property",
+        {"name": object_name, "path": path, "max_items": max_items})
+    return json.dumps(result, indent=2, ensure_ascii=False)
 
 
 @mcp.tool()

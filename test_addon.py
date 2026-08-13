@@ -389,6 +389,131 @@ def test_object_info_missing_raises(m):
     raise AssertionError("expected ValueError for a missing object")
 
 
+# ---------------------------------------------------------------- get_object_property
+
+def _shape_key_object(name="__prop_obj__"):
+    """A one-quad mesh with a Basis and one named shape key."""
+    import bpy
+    mesh = bpy.data.meshes.new(name + "_mesh")
+    mesh.from_pydata([(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)], [],
+                     [(0, 1, 2, 3)])
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.collection.objects.link(obj)
+    obj.shape_key_add(name="Basis")
+    key = obj.shape_key_add(name="Smile")
+    key.value = 0.5
+    key.mute = True
+    return obj, mesh
+
+
+def test_property_reads_a_shape_key_by_name(m):
+    import bpy
+    obj, mesh = _shape_key_object()
+    try:
+        result = m.BlenderDevMCPServer().get_object_property(
+            obj.name, 'data.shape_keys.key_blocks["Smile"]')
+        assert result["type"] == "ShapeKey", result
+        assert result["value"]["value"] == 0.5, result
+        assert result["value"]["mute"] is True, result
+        assert result["value"]["name"] == "Smile", result
+        json.dumps(result)
+    finally:
+        bpy.data.objects.remove(obj)
+        bpy.data.meshes.remove(mesh)
+
+
+def test_property_reads_a_scalar_field_directly(m):
+    import bpy
+    obj, mesh = _shape_key_object()
+    try:
+        result = m.BlenderDevMCPServer().get_object_property(
+            obj.name, 'data.shape_keys.key_blocks["Smile"].value')
+        assert result["value"] == 0.5, result
+    finally:
+        bpy.data.objects.remove(obj)
+        bpy.data.meshes.remove(mesh)
+
+
+def test_property_collection_without_index_is_capped_names(m):
+    import bpy
+    obj, mesh = _shape_key_object()
+    try:
+        result = m.BlenderDevMCPServer().get_object_property(
+            obj.name, "data.shape_keys.key_blocks")
+        assert set(result["value"]["names"]) == {"Basis", "Smile"}, result
+    finally:
+        bpy.data.objects.remove(obj)
+        bpy.data.meshes.remove(mesh)
+
+
+def test_property_datablock_reference_is_named_not_recursed(m):
+    """relative_key points back at the Basis ShapeKey - must not recurse into it."""
+    import bpy
+    obj, mesh = _shape_key_object()
+    try:
+        result = m.BlenderDevMCPServer().get_object_property(
+            obj.name, 'data.shape_keys.key_blocks["Smile"]')
+        rel = result["value"]["relative_key"]
+        assert rel == {"type": "ShapeKey", "name": "Basis"}, rel
+    finally:
+        bpy.data.objects.remove(obj)
+        bpy.data.meshes.remove(mesh)
+
+
+def test_property_missing_index_raises_with_context(m):
+    import bpy
+    obj, mesh = _shape_key_object()
+    try:
+        try:
+            m.BlenderDevMCPServer().get_object_property(
+                obj.name, 'data.shape_keys.key_blocks["nope"]')
+        except ValueError as exc:
+            assert "nope" in str(exc), exc
+        else:
+            raise AssertionError("expected ValueError for a missing key")
+    finally:
+        bpy.data.objects.remove(obj)
+        bpy.data.meshes.remove(mesh)
+
+
+def test_property_rejects_arbitrary_expressions(m):
+    """The path grammar is not an evaluator - underscored/dunder access must fail closed."""
+    import bpy
+    name = next(o.name for o in bpy.data.objects if o.type == "MESH")
+    try:
+        m.BlenderDevMCPServer().get_object_property(
+            name, "modifiers.__class__")
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError for a non-identifier path segment")
+
+
+def test_property_missing_object_raises(m):
+    try:
+        m.BlenderDevMCPServer().get_object_property("nope", "modifiers")
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError for a missing object")
+
+
+def test_property_unnamed_collection_items_report_count_not_padding(m):
+    """ShapeKey.data/.points hold thousands of unnamed ShapeKeyPoint structs.
+
+    Regression: describing each item fell back to {"type": ..., "name": None},
+    so a shape key's own detail carried 2 * max_items copies of that with no
+    information in any of them. Only the count is meaningful there.
+    """
+    import bpy
+    obj, mesh = _shape_key_object()
+    try:
+        result = m.BlenderDevMCPServer().get_object_property(
+            obj.name, 'data.shape_keys.key_blocks["Smile"].data')
+        assert result["value"] == {"count": 4}, result
+    finally:
+        bpy.data.objects.remove(obj)
+        bpy.data.meshes.remove(mesh)
+
+
 # ---------------------------------------------------------------- execute_code
 
 def test_stdout_returned(m):

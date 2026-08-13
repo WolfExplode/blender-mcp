@@ -11,6 +11,7 @@ import io
 import json
 import math
 import os
+import re
 import socket
 import sys
 import threading
@@ -544,6 +545,130 @@ class BlenderDevMCPServer:
                     except Exception as exc:
                         info["mesh"]["selection"] = {"error": str(exc)}
         return info
+
+    # Accepts exactly `identifier(.identifier | [index])*`, where an index is a
+    # bare integer or a single/double-quoted string. Deliberately not a general
+    # expression evaluator - narrow enough to reach anything named in an
+    # object's RNA tree (modifiers["Subsurf"], data.shape_keys.key_blocks["Smile"],
+    # constraints[0]) without exec()'ing client-supplied text. Identifiers must
+    # start with a letter, not an underscore: no RNA property is ever named
+    # like that, and disallowing it closes off Python internals such as
+    # __class__ or __globals__ that a bare hasattr()/getattr() walk would
+    # otherwise happily follow.
+    _PATH_SEGMENT_RE = re.compile(r'^([A-Za-z][A-Za-z0-9_]*)((?:\[[^\]]+\])*)$')
+    _PATH_INDEX_RE = re.compile(r'\[([^\]]+)\]')
+
+    @classmethod
+    def _resolve_path(cls, root, path):
+        """Walk a dotted attribute/index path from `root`, returning what it names."""
+        obj = root
+        for segment in path.split("."):
+            m = cls._PATH_SEGMENT_RE.match(segment)
+            if not m:
+                raise ValueError(f"Invalid path segment: {segment!r}")
+            attr, indices = m.groups()
+            if not hasattr(obj, attr):
+                raise ValueError(f"{attr!r} not found on {obj!r}")
+            obj = getattr(obj, attr)
+            for idx_text in cls._PATH_INDEX_RE.findall(indices):
+                if len(idx_text) >= 2 and idx_text[0] in "\"'" and idx_text[-1] == idx_text[0]:
+                    key = idx_text[1:-1]
+                elif idx_text.lstrip("-").isdigit():
+                    key = int(idx_text)
+                else:
+                    key = idx_text
+                try:
+                    obj = obj[key]
+                except (KeyError, IndexError, TypeError) as exc:
+                    raise ValueError(
+                        f"Index {idx_text!r} not found in {attr!r}: {exc}") from exc
+        return obj
+
+    @classmethod
+    def _describe_value(cls, value, max_items, expand=True):
+        """JSON-safe rendering of one RNA value.
+
+        Scalars pass through as-is. Vector/color/euler/quaternion/matrix types
+        become plain lists. A reference to another datablock (an ID - object,
+        mesh, material...) is always named rather than followed: recursing
+        would risk walking back into the object this call started from, and a
+        caller who wants that datablock's own detail can point a fresh call
+        at it directly.
+
+        `expand` gates whether a *non-ID* bpy_struct (a modifier, a shape
+        key, a constraint) is walked into or just named+typed: it is True
+        only for the path's own target, so a struct field that references
+        another struct of the same kind - ShapeKey.relative_key pointing at
+        another ShapeKey, not uncommonly itself - is named once rather than
+        recursed into forever. A plain bpy_struct has no guaranteed `name`,
+        so the summary falls back to its type. Collections are always a
+        capped list of names, matching get_object_info's own shape.
+        """
+        if value is None or isinstance(value, (int, float, str, bool)):
+            return value
+        if isinstance(value, mathutils.Matrix):
+            return [[round(float(c), 6) for c in row] for row in value]
+        if isinstance(value, (mathutils.Vector, mathutils.Euler,
+                              mathutils.Color, mathutils.Quaternion)):
+            return [round(float(c), 6) for c in value]
+        if isinstance(value, bpy.types.ID):
+            return {"type": type(value).__name__, "name": value.name}
+        if isinstance(value, bpy.types.bpy_prop_collection):
+            # A collection's items are all one RNA type, so one probe decides
+            # the whole collection. Per-vertex arrays (ShapeKey.data/.points,
+            # Mesh.vertices) hold thousands of unnamed structs - listing
+            # max_items copies of {"type": "ShapeKeyPoint", "name": null} is
+            # pure noise, so those report a bare count instead.
+            items = list(value)
+            if not items:
+                return cls._capped(items, max_items)
+            if not hasattr(items[0], "name"):
+                return {"count": len(items)}
+            return cls._capped((v.name for v in items), max_items)
+        if hasattr(value, "bl_rna"):
+            if not expand:
+                return {"type": type(value).__name__,
+                        "name": getattr(value, "name", None)}
+            return cls._describe_struct(value, max_items)
+        return repr(value)
+
+    @classmethod
+    def _describe_struct(cls, value, max_items):
+        out = {}
+        for prop in value.bl_rna.properties:
+            if prop.identifier == "rna_type":
+                continue
+            try:
+                out[prop.identifier] = cls._describe_value(
+                    getattr(value, prop.identifier), max_items, expand=False)
+            except Exception as exc:
+                out[prop.identifier] = f"<unreadable: {exc}>"
+        return out
+
+    @command("get_object_property")
+    def get_object_property(self, name, path, max_items=40):
+        """Read one specific piece of data hanging off an object by RNA path.
+
+        get_object_info answers fixed, shallow questions (what shape keys
+        exist, how many modifiers); this answers a targeted one (this shape
+        key's value and mute state, this modifier's settings, this
+        constraint's target) without dropping into execute_blender_code for
+        every nested field Blender exposes but no bespoke tool names.
+
+        Parameters:
+        - name: Object to start from (see get_object_info)
+        - path: Dotted RNA path from the object, e.g. 'modifiers["Subsurf"]',
+          'data.shape_keys.key_blocks["Smile"]', 'constraints[0]'
+        - max_items: Cap on names listed for any collection encountered along
+          the way (default 40; 0 for all)
+        """
+        obj = self._resolve_name(bpy.data.objects, name, "Object")
+        target = self._resolve_path(obj, path)
+        return {
+            "path": path,
+            "type": type(target).__name__,
+            "value": self._describe_value(target, max_items),
+        }
 
     @command("get_collection_tree")
     def get_collection_tree(self, max_items=20):
