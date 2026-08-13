@@ -332,6 +332,11 @@ class BlenderDevMCPServer:
     def __init__(self, host="localhost", port=DEFAULT_PORT):
         self.transport = SocketTransport(
             self._dispatch_on_main_thread, host=host, port=port)
+        # {old object name: current object name}, session-local. Exists so a
+        # caller resolving object_name for bone/vertex_group/shape_key does
+        # not have to already know whether the object itself was renamed
+        # before or after that call - see _resolve_name's `aliases` param.
+        self._object_renames = {}
 
     # {wire name: method name}, populated from the @command decorators once the
     # class body has finished executing. See the assignment below the class.
@@ -444,8 +449,9 @@ class BlenderDevMCPServer:
         ]
 
     @staticmethod
-    def _resolve_name(bpy_collection, name, kind):
-        """Look up `name` in a bpy_prop_collection, tolerant of Unicode drift.
+    def _resolve_name(bpy_collection, name, kind, aliases=None):
+        """Look up `name` in a bpy_prop_collection, tolerant of Unicode drift
+        and of this session's own renames.
 
         MCP names arrive as plain JSON strings that can drift from what
         Blender actually stored through routes that never touch Blender at
@@ -459,7 +465,20 @@ class BlenderDevMCPServer:
 
         Tries the exact name first - the common case, and the only one that
         can't misfire on two distinct objects that happen to normalize the
-        same. Falls back to a normalized scan only on a miss.
+        same. Falls back to a normalized scan, then to `aliases` (see
+        `_object_renames`), only on a miss - so a live object that happens to
+        carry a name someone else used to have can never be shadowed by a
+        stale alias.
+
+        `aliases`: a session-local {old_name: current_name} map. A rename of
+        A to B to C leaves both A and B pointing at C, so a name captured
+        before *either* rename still resolves after *both* - this is what
+        removes the ordering trap between renaming an object and renaming
+        the bone/vertex_group/shape_key collection that object_name points
+        at: whichever of the two calls happens first, the other's
+        object_name keeps working. Chases the chain itself defensively
+        (`seen`) even though callers should only ever produce a DAG, not a
+        cycle.
         """
         exact = bpy_collection.get(name)
         if exact is not None:
@@ -476,6 +495,17 @@ class BlenderDevMCPServer:
                 f"{kind} not found: {name!r} - no exact match, and "
                 f"{len(matches)} names normalize to the same text so the "
                 f"match is ambiguous: {names}")
+
+        if aliases:
+            current, seen = name, set()
+            while current in aliases and current not in seen:
+                seen.add(current)
+                current = aliases[current]
+            if current != name:
+                resolved = bpy_collection.get(current)
+                if resolved is not None:
+                    return resolved
+
         raise ValueError(f"{kind} not found: {name!r}")
 
     @staticmethod
@@ -509,7 +539,7 @@ class BlenderDevMCPServer:
 
     @command("get_object_info")
     def get_object_info(self, name, max_items=40):
-        obj = self._resolve_name(bpy.data.objects, name, "Object")
+        obj = self._resolve_name(bpy.data.objects, name, "Object", self._object_renames)
 
         info = {
             "name": obj.name,
@@ -662,7 +692,7 @@ class BlenderDevMCPServer:
         - max_items: Cap on names listed for any collection encountered along
           the way (default 40; 0 for all)
         """
-        obj = self._resolve_name(bpy.data.objects, name, "Object")
+        obj = self._resolve_name(bpy.data.objects, name, "Object", self._object_renames)
         target = self._resolve_path(obj, path)
         return {
             "path": path,
@@ -777,7 +807,7 @@ class BlenderDevMCPServer:
             roots = [o for o in bpy.context.scene.objects if o.parent is None]
             parent = None
         else:
-            obj = self._resolve_name(bpy.data.objects, name, "Object")
+            obj = self._resolve_name(bpy.data.objects, name, "Object", self._object_renames)
             roots = list(obj.children)
             parent = {"name": obj.name, "type": obj.type}
 
@@ -824,7 +854,7 @@ class BlenderDevMCPServer:
         - max_items: Cap on children listed (default 25; 0 for all). The
           true count is always in total_children even when capped.
         """
-        obj = self._resolve_name(bpy.data.objects, object_name, "Object")
+        obj = self._resolve_name(bpy.data.objects, object_name, "Object", self._object_renames)
         if obj.type != 'ARMATURE':
             raise ValueError(
                 f"{object_name!r} is a {obj.type} object, not an Armature - "
@@ -1136,7 +1166,7 @@ class BlenderDevMCPServer:
             raise ValueError(
                 f"kind={kind!r} needs object_name - {kind}s live on an "
                 "object, not in bpy.data directly")
-        obj = self._resolve_name(bpy.data.objects, object_name, "Object")
+        obj = self._resolve_name(bpy.data.objects, object_name, "Object", self._object_renames)
 
         if kind == "bone":
             if obj.type != 'ARMATURE':
@@ -1371,6 +1401,8 @@ class BlenderDevMCPServer:
                     collisions.append({"requested_from": old,
                                        "requested_to": new,
                                        "actual": item.name})
+                if kind == "object":
+                    self._object_renames[old] = item.name
         except Exception:
             after = state.fingerprint()
             pushed = undo.push(f"MCP {label}")
@@ -1459,6 +1491,8 @@ class BlenderDevMCPServer:
                         collisions.append({"kind": kind, "object_name": object_name,
                                            "requested_from": old, "requested_to": new,
                                            "actual": item.name})
+                    if kind == "object":
+                        self._object_renames[old] = item.name
                 target_reports.append({"kind": kind, "object_name": object_name,
                                        "requested": len(this_renames),
                                        "applied": len(target_applied)})
@@ -1516,6 +1550,28 @@ class BlenderDevMCPServer:
         else:
             entry["names"] = names
         return entry
+
+    @staticmethod
+    def _with_object_types(names):
+        """Object names as "name [TYPE]" instead of bare names.
+
+        Every other audit_names bucket is already homogeneous - a mesh
+        datablock, a material - but "objects" mixes Empties, Meshes,
+        Armatures and everything else with no way to tell which is which
+        without a follow-up get_object_info call per candidate. That was the
+        actual friction in a translation pass that needed to find "the mesh
+        object with this name" among an Empty root, an Armature and a Mesh
+        all sharing a name stem: three tools existed for object type
+        (find_objects, get_object_info, get_scene_info) and audit_names -
+        the one already returning the name - was not one of them. A stale
+        name from a since-renamed object silently returns no type tag rather
+        than raising, since this exists to enrich search results, not to
+        duplicate _resolve_name's lookup contract.
+        """
+        return [
+            f"{name} [{obj.type}]" if (obj := bpy.data.objects.get(name)) else name
+            for name in names
+        ]
 
     @command("audit_names")
     def audit_names(self, pattern=None, max_items=50, kind=None, object_name=None):
@@ -1584,7 +1640,11 @@ class BlenderDevMCPServer:
 
         Returns {"matched": {kind: {"count", "names", "omitted"?}, ...},
         "total_matches": N}. A kind with no matches is left out entirely
-        rather than reported as zero, same reasoning as `state.diff`.
+        rather than reported as zero, same reasoning as `state.diff`. Names
+        in the "objects"/"object" bucket are suffixed "[TYPE]"
+        (bpy.types.Object.type: MESH, EMPTY, ARMATURE, ...) since that bucket
+        is the one place several unrelated kinds of thing share a namespace -
+        every other bucket is already homogeneous.
         """
         if object_name is not None and kind is None:
             raise ValueError(
@@ -1600,6 +1660,8 @@ class BlenderDevMCPServer:
             names = sorted({item.name for item in collection if predicate(item.name)})
             if not names:
                 return {"matched": {}, "total_matches": 0}
+            if kind == "object":
+                names = self._with_object_types(names)
             return {"matched": {kind: self._audit_entry(names, max_items)},
                     "total_matches": len(names)}
 
@@ -1609,6 +1671,8 @@ class BlenderDevMCPServer:
             names = sorted({name for name in items.values() if predicate(name)})
             if not names:
                 continue
+            if snap_kind == "objects":
+                names = self._with_object_types(names)
             total += len(names)
             matched[snap_kind] = self._audit_entry(names, max_items)
 

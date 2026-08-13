@@ -1869,6 +1869,120 @@ def test_rename_bone_cascades_to_vertex_group_and_reports_it(m):
         _drop_rig("__rename_cascade__")
 
 
+def test_object_rename_alias_lets_a_stale_object_name_still_resolve(m):
+    """The ordering trap _object_renames exists to remove: rename an object,
+    then look it up again by the name it had before - a caller translating
+    an object's own name and something scoped to that object (bones, shape
+    keys) in either order should never have to track which happened first.
+    """
+    import bpy
+    obj = bpy.data.objects.new("__alias_before__", None)
+    bpy.context.scene.collection.objects.link(obj)
+    m.undo.reset()
+    bpy.ops.ed.undo_push(message="baseline for alias rename")
+    try:
+        server = m.BlenderDevMCPServer()
+        result = server.rename(
+            kind="object", renames={"__alias_before__": "__alias_after__"},
+            undo_label="rename object for alias test")
+        assert result["applied"] == 1, result
+
+        info = server.get_object_info("__alias_before__")
+        assert info["name"] == "__alias_after__", info
+    finally:
+        found = bpy.data.objects.get("__alias_after__")
+        if found is not None:
+            bpy.data.objects.remove(found)
+
+
+def test_object_rename_alias_chases_a_chain(m):
+    """A renamed to B, then B renamed to C: a caller still holding A must
+    resolve all the way to C, not dead-end at the no-longer-current B.
+    """
+    import bpy
+    obj = bpy.data.objects.new("__alias_chain_a__", None)
+    bpy.context.scene.collection.objects.link(obj)
+    m.undo.reset()
+    bpy.ops.ed.undo_push(message="baseline for alias chain")
+    try:
+        server = m.BlenderDevMCPServer()
+        server.rename(kind="object", renames={"__alias_chain_a__": "__alias_chain_b__"},
+                      undo_label="rename a to b")
+        server.rename(kind="object", renames={"__alias_chain_b__": "__alias_chain_c__"},
+                      undo_label="rename b to c")
+
+        info = server.get_object_info("__alias_chain_a__")
+        assert info["name"] == "__alias_chain_c__", info
+    finally:
+        found = bpy.data.objects.get("__alias_chain_c__")
+        if found is not None:
+            bpy.data.objects.remove(found)
+
+
+def test_object_rename_alias_never_shadows_a_live_object(m):
+    """A name a rename vacated can end up back in use by something else
+    entirely. Alias resolution only runs after an exact-name lookup already
+    missed, so the live object with that name must always win over chasing
+    the stale alias to wherever the original object ended up.
+    """
+    import bpy
+    first = bpy.data.objects.new("__alias_reuse__", None)
+    bpy.context.scene.collection.objects.link(first)
+    m.undo.reset()
+    bpy.ops.ed.undo_push(message="baseline for alias reuse")
+    try:
+        server = m.BlenderDevMCPServer()
+        server.rename(kind="object", renames={"__alias_reuse__": "__alias_reuse_renamed__"},
+                      undo_label="vacate the name")
+
+        second = bpy.data.objects.new("__alias_reuse__", None)
+        bpy.context.scene.collection.objects.link(second)
+
+        info = server.get_object_info("__alias_reuse__")
+        assert info["name"] == "__alias_reuse__", info
+        assert bpy.data.objects["__alias_reuse__"] == second
+    finally:
+        for name in ("__alias_reuse__", "__alias_reuse_renamed__"):
+            found = bpy.data.objects.get(name)
+            if found is not None:
+                bpy.data.objects.remove(found)
+
+
+def test_rename_bone_kind_resolves_object_name_through_a_prior_object_rename(m):
+    """The concrete case this was built for: renaming a rig's own object and
+    renaming its bones are two separate rename() calls, and either order
+    must work. Here the object rename happens first, then the bone rename
+    is still addressed by the object's pre-rename name.
+    """
+    import bpy
+    arm_obj, mesh_obj = _rig_with_vertex_group("__alias_bone_kind__")
+    old_arm_name = arm_obj.name
+    m.undo.reset()
+    bpy.ops.ed.undo_push(message="baseline for alias bone kind")
+    try:
+        server = m.BlenderDevMCPServer()
+        server.rename(kind="object", renames={old_arm_name: f"{old_arm_name}_renamed"},
+                      undo_label="rename armature object")
+
+        result = server.rename(
+            kind="bone", renames={"original": "renamed"},
+            object_name=old_arm_name, undo_label="rename bone via stale object_name")
+        assert result["applied"] == 1, result
+        assert arm_obj.data.bones[0].name == "renamed"
+    finally:
+        for name in (old_arm_name, f"{old_arm_name}_renamed",
+                     "__alias_bone_kind___mesh_obj"):
+            found = bpy.data.objects.get(name)
+            if found is not None:
+                bpy.data.objects.remove(found)
+        arm_data = bpy.data.armatures.get("__alias_bone_kind___arm_data")
+        if arm_data is not None:
+            bpy.data.armatures.remove(arm_data)
+        mesh = bpy.data.meshes.get("__alias_bone_kind___mesh")
+        if mesh is not None:
+            bpy.data.meshes.remove(mesh)
+
+
 def test_rename_reports_missing_names_without_raising(m):
     tree = _undo_baseline(m, "__rename_missing__")
     try:
@@ -2140,7 +2254,7 @@ def test_audit_names_finds_non_ascii_names_by_default(m):
     try:
         result = m.BlenderDevMCPServer().audit_names()
         assert result["total_matches"] >= 1, result
-        assert obj.name in result["matched"]["objects"]["names"], result
+        assert f"{obj.name} [{obj.type}]" in result["matched"]["objects"]["names"], result
     finally:
         bpy.data.objects.remove(obj)
 
@@ -2152,7 +2266,7 @@ def test_audit_names_pattern_searches_a_literal_substring(m):
     try:
         found = m.BlenderDevMCPServer().audit_names(pattern="marker_needle")
         assert found["total_matches"] == 1, found
-        assert found["matched"]["objects"]["names"] == [obj.name], found
+        assert found["matched"]["objects"]["names"] == [f"{obj.name} [{obj.type}]"], found
 
         not_found = m.BlenderDevMCPServer().audit_names(pattern="no_such_pattern_anywhere")
         assert not_found["total_matches"] == 0, not_found
