@@ -472,6 +472,101 @@ def test_blender_going_away_entirely_is_reported():
     raise AssertionError("expected an error once Blender is gone")
 
 
+# ------------------------------------------------------- offline Blender docs
+
+def _docs_or_skip():
+    """The docs are a gitignored ~2 GB download, so they may simply be absent."""
+    from blender_dev_mcp import docs
+    if docs.docs_root() is None:
+        print("    (skipped: offline docs not installed)", end=" ")
+        return None
+    return docs
+
+
+def test_docs_root_honours_the_env_override():
+    from blender_dev_mcp import docs
+
+    saved = os.environ.get(docs.DOCS_ENV)
+    os.environ[docs.DOCS_ENV] = os.path.dirname(os.path.abspath(__file__))
+    try:
+        assert docs.docs_root() is not None, "an existing override dir must be used"
+        os.environ[docs.DOCS_ENV] = os.path.join("no", "such", "place")
+        assert docs.docs_root() is None, \
+            "a bogus override must report absent, not silently fall back"
+    finally:
+        if saved is None:
+            os.environ.pop(docs.DOCS_ENV, None)
+        else:
+            os.environ[docs.DOCS_ENV] = saved
+
+
+def test_inventory_reports_the_blender_version_it_documents():
+    docs = _docs_or_skip()
+    if docs is None:
+        return
+    entries, version = docs.inventory()
+    assert len(entries) > 1000, f"suspiciously small inventory: {len(entries)}"
+    # The version stamp is the whole point: these docs must be attributable to a
+    # release, unlike a source tree that always tracks main.
+    assert version and "Blender" in version, version
+
+
+def test_symbol_lookup_finds_an_attribute_by_bare_name():
+    docs = _docs_or_skip()
+    if docs is None:
+        return
+    hits = docs.find_symbols("set_inverse_pending")
+    assert hits, "bare attribute names must resolve"
+    names = [h[0] for h in hits]
+    assert "bpy.types.ChildOfConstraint.set_inverse_pending" in names, names
+
+
+def test_symbol_lookup_deduplicates():
+    docs = _docs_or_skip()
+    if docs is None:
+        return
+    hits = docs.find_symbols("bpy.types.ChildOfConstraint")
+    names = [h[0] for h in hits]
+    assert len(names) == len(set(names)), f"duplicate symbols returned: {names}"
+    assert names[0] == "bpy.types.ChildOfConstraint", "exact match must rank first"
+
+
+def test_page_text_drops_navigation_and_permalink_noise():
+    docs = _docs_or_skip()
+    if docs is None:
+        return
+    text = docs.page_text(docs.api_dir() / "bpy.types.ChildOfConstraint.html")
+    assert "set_inverse_pending" in text, "the actual content must survive"
+    assert "¶" not in text, "Sphinx permalink pilcrows must be stripped"
+    assert "’" not in text and "“" not in text, \
+        "curly quotes break copy-pasting an enum value into code"
+    assert "Toggle table of contents" not in text, "theme chrome leaked in"
+    assert "<div" not in text and "</p>" not in text, "raw markup leaked in"
+
+
+def test_prose_search_finds_enum_values_absent_from_the_inventory():
+    docs = _docs_or_skip()
+    if docs is None:
+        return
+    # Enum members are page prose, not objects.inv entries - the fallback exists
+    # precisely for them.
+    assert not docs.find_symbols("TRACK_NEGATIVE_Z"), \
+        "if this is indexed now, the fallback is no longer what is being tested"
+    hits = docs.search_prose("TRACK_NEGATIVE_Z", limit=2)
+    assert hits, "enum values must be findable somehow"
+    assert any("Constraint" in path for path, _ in hits), hits
+
+
+def test_prose_search_skips_generated_index_pages():
+    docs = _docs_or_skip()
+    if docs is None:
+        return
+    # genindex-all.html contains every term in the docs, so it matches anything
+    # and explains nothing.
+    hits = docs.search_prose("set_inverse_pending", limit=5)
+    assert not any("genindex" in path for path, _ in hits), hits
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failures = 0

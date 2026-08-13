@@ -14,3 +14,8 @@ wheels/
 
 # reference repos
 reference
+
+# Offline Blender docs: ~2 GB of downloaded HTML. Re-downloadable, so it is not
+# worth versioning - but docs/undo_redo_notes.md beside it is hand-written and
+# stays tracked, which is why this ignores the subfolder rather than docs/.
+docs/Blender Documentation/

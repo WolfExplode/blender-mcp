@@ -99,11 +99,23 @@ def remove_stderr_tee():
         _stderr_tee = None
 
 
-class BlenderDevMCPServer:
+class SocketTransport:
+    """Accepts connections and turns the byte stream into whole commands.
+
+    Deliberately knows nothing about Blender or about what any command means:
+    it owns sockets, threads and framing, and hands each decoded command to the
+    callback it was constructed with. Keeping this separate from the dispatcher
+    is what makes `running` unambiguous -- it means "the listener is serving",
+    and nothing else, so the question "may this command still execute?" has one
+    owner instead of being inferred from shared state.
+    """
+
     # A command that never parses would otherwise grow the buffer forever.
     MAX_BUFFER = 32 * 1024 * 1024
 
-    def __init__(self, host="localhost", port=DEFAULT_PORT):
+    def __init__(self, on_command, host="localhost", port=DEFAULT_PORT):
+        # on_command(client, command) is called from a per-connection thread.
+        self._on_command = on_command
         self.host = host
         self.port = port
         self.running = False
@@ -119,6 +131,25 @@ class BlenderDevMCPServer:
     # lifecycle
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _claim_port(sock):
+        """Ask for the port in the way that means "mine" on this platform.
+
+        SO_REUSEADDR does not mean the same thing on Windows as it does on
+        Unix. There it permits a *second* socket to bind a port that is already
+        being listened on, and new connections then land on whichever bound
+        last - so opening a second Blender would silently steal the MCP port
+        from the first, with no error on either side and no way to tell which
+        instance a client is talking to. SO_EXCLUSIVEADDRUSE is the Windows
+        spelling of the guarantee actually wanted: refuse to bind if someone is
+        already there, and refuse to be displaced later.
+
+        On Unix, SO_REUSEADDR keeps its usual meaning - rebind through TIME_WAIT
+        without blocking a live listener - which is exactly right here.
+        """
+        option = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        sock.setsockopt(socket.SOL_SOCKET, option or socket.SO_REUSEADDR, 1)
+
     def start(self):
         if bpy.app.background:
             print("BlenderDevMCP: cannot serve in background mode (blender -b) - "
@@ -132,9 +163,11 @@ class BlenderDevMCPServer:
         self.running = True
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._claim_port(self.socket)
             self.socket.bind((self.host, self.port))
-            self.socket.listen(1)
+            # Backlog of a few: a client that reconnects the instant it notices
+            # a reload can arrive before the accept loop comes back around.
+            self.socket.listen(5)
 
             self.server_thread = threading.Thread(target=self._server_loop, daemon=True)
             self.server_thread.start()
@@ -245,13 +278,19 @@ class BlenderDevMCPServer:
                         buffer = b""
                         break
                     buffer = text[end:].encode("utf-8")
-                    self._dispatch_on_main_thread(client, command)
+                    self._on_command(client, command)
+        except OSError as exc:
+            # stop() closes accepted sockets out from under their handler
+            # threads, so a socket error while shutting down is the expected
+            # exit path. Only a failure while still serving is a real fault.
+            if self.running:
+                print(f"BlenderDevMCP: client handler error - {exc}")
         except Exception as exc:
             print(f"BlenderDevMCP: client handler error - {exc}")
         finally:
             with self._clients_lock:
                 self._clients.discard(client)
-            with suppress(Exception):
+            with suppress(OSError):
                 client.close()
 
     def _discard_if_oversized(self, buffer):
@@ -266,15 +305,72 @@ class BlenderDevMCPServer:
             return True
         return False
 
+
+def command(name):
+    """Register a BlenderDevMCPServer method as the handler for a wire command.
+
+    The name lives next to the function it names, so adding a handler cannot
+    leave a dispatch table half-updated, and the table is built once at class
+    creation rather than rebuilt on every command.
+    """
+    def register(fn):
+        fn._command_name = name
+        return fn
+    return register
+
+
+class BlenderDevMCPServer:
+    """Dispatches wire commands to handlers and runs them on Blender's main thread.
+
+    Owns no sockets: the transport is a collaborator, so the only lifecycle
+    question this class asks is "is the transport still serving?".
+    """
+
+    def __init__(self, host="localhost", port=DEFAULT_PORT):
+        self.transport = SocketTransport(
+            self._dispatch_on_main_thread, host=host, port=port)
+
+    # {wire name: method name}, populated from the @command decorators once the
+    # class body has finished executing. See the assignment below the class.
+    HANDLERS = {}
+
+    # -- transport passthrough, so callers and the UI see one object ----
+
+    @property
+    def running(self):
+        return self.transport.running
+
+    @property
+    def host(self):
+        return self.transport.host
+
+    @property
+    def port(self):
+        return self.transport.port
+
+    @port.setter
+    def port(self, value):
+        self.transport.port = value
+
+    def start(self):
+        self.transport.start()
+
+    def stop(self):
+        self.transport.stop()
+
+    # ------------------------------------------------------------------
+    # dispatch
+    # ------------------------------------------------------------------
+
     def _dispatch_on_main_thread(self, client, command):
         """Queue a command for Blender's main thread and reply when it is done."""
 
         def run():
             # The timer fires on the main thread some time after queueing, and
             # stop() can land in that gap. Running anyway would mutate the blend
-            # file on behalf of a server the client has already been hung up on,
-            # with nowhere to send the result.
-            if not self.running:
+            # file on behalf of a client that has already been hung up on, with
+            # nowhere to send the result.
+            if not self.transport.running:
                 print("BlenderDevMCP: server stopped before "
                       f"{command.get('type')!r} ran - discarded")
                 return None
@@ -283,44 +379,24 @@ class BlenderDevMCPServer:
             except Exception as exc:
                 traceback.print_exc()
                 response = {"status": "error", "message": str(exc)}
-            with suppress(Exception):
+            with suppress(OSError):
                 client.sendall(json.dumps(response).encode("utf-8"))
             return None
 
         bpy.app.timers.register(run, first_interval=0.0)
 
-    # ------------------------------------------------------------------
-    # dispatch
-    # ------------------------------------------------------------------
-
     def execute_command(self, command):
         cmd_type = command.get("type")
         params = command.get("params", {})
 
-        handlers = {
-            "get_scene_info": self.get_scene_info,
-            "get_object_info": self.get_object_info,
-            "get_viewport_screenshot": self.get_viewport_screenshot,
-            "execute_code": self.execute_code,
-            "undo_edit": self.undo_edit,
-            "get_stderr_log": self.get_stderr_log,
-            "list_node_trees": self.list_node_trees,
-            "get_node_tree_outline": self.get_node_tree_outline,
-            "get_node_detail": self.get_node_detail,
-            "validate_node_tree": self.validate_node_tree,
-            "snapshot_node_tree": self.snapshot_node_tree,
-            "restore_node_snapshot": self.restore_node_snapshot,
-            "annotate_node_tree": self.annotate_node_tree,
-        }
-
-        handler = handlers.get(cmd_type)
-        if handler is None:
-            known = ", ".join(sorted(handlers))
+        method = self.HANDLERS.get(cmd_type)
+        if method is None:
+            known = ", ".join(sorted(self.HANDLERS))
             return {"status": "error",
                     "message": f"Unknown command type: {cmd_type}. Known: {known}"}
 
         try:
-            return {"status": "success", "result": handler(**params)}
+            return {"status": "success", "result": getattr(self, method)(**params)}
         except Exception as exc:
             traceback.print_exc()
             return {"status": "error", "message": str(exc)}
@@ -329,6 +405,7 @@ class BlenderDevMCPServer:
     # handlers
     # ------------------------------------------------------------------
 
+    @command("get_scene_info")
     def get_scene_info(self, max_objects=10):
         scene = bpy.context.scene
         info = {
@@ -392,6 +469,7 @@ class BlenderDevMCPServer:
             "select_mode": list(bpy.context.tool_settings.mesh_select_mode),
         }
 
+    @command("get_object_info")
     def get_object_info(self, name, max_items=40):
         obj = bpy.data.objects.get(name)
         if not obj:
@@ -432,6 +510,7 @@ class BlenderDevMCPServer:
                         info["mesh"]["selection"] = {"error": str(exc)}
         return info
 
+    @command("get_viewport_screenshot")
     def get_viewport_screenshot(self, max_size=800, filepath=None, format="png"):
         """Render the 3D viewport to `filepath`.
 
@@ -516,6 +595,7 @@ class BlenderDevMCPServer:
         return {"success": True, "width": width, "height": height,
                 "filepath": filepath, "method": method}
 
+    @command("execute_code")
     def execute_code(self, code, undo_label=None):
         """Run Python in Blender and return everything it printed.
 
@@ -578,10 +658,12 @@ class BlenderDevMCPServer:
             result["undo_budget"] = undo.budget()
         return result
 
+    @command("list_node_trees")
     def list_node_trees(self):
         """Every geometry node tree in the file, with enough to pick one."""
         return geonodes.list_trees()
 
+    @command("get_node_tree_outline")
     def get_node_tree_outline(self, name):
         """Structural summary of one geometry node tree.
 
@@ -600,6 +682,7 @@ class BlenderDevMCPServer:
                 f"file: {known}")
         return geonodes.tree_outline(tree)
 
+    @command("get_node_detail")
     def get_node_detail(self, name, frame=None):
         """Nodes, settings and links for one frame of a geometry node tree.
 
@@ -616,6 +699,7 @@ class BlenderDevMCPServer:
                 f"file: {known}")
         return geonodes.node_detail(tree, frame)
 
+    @command("validate_node_tree")
     def validate_node_tree(self, name, evaluate=True, max_objects=8):
         """Check a geometry node tree and report what is wrong with it."""
         tree = bpy.data.node_groups.get(name)
@@ -628,6 +712,7 @@ class BlenderDevMCPServer:
         return geonodes.validate_tree(
             tree, evaluate=evaluate, max_objects=max_objects)
 
+    @command("snapshot_node_tree")
     def snapshot_node_tree(self, name, path=None, keep_last=10):
         """Write the Python that rebuilds a tree to disk; return the path.
 
@@ -637,6 +722,7 @@ class BlenderDevMCPServer:
         """
         return ntp_bridge.snapshot_tree(name, path, keep_last=keep_last)
 
+    @command("undo_edit")
     def undo_edit(self, steps=1):
         """Take back writes this session made, using Blender's undo stack.
 
@@ -646,6 +732,7 @@ class BlenderDevMCPServer:
         """
         return undo.undo(steps)
 
+    @command("restore_node_snapshot")
     def restore_node_snapshot(self, path):
         """Run a snapshot file, recreating the trees it holds."""
         result = ntp_bridge.restore_snapshot(path, undo_push=False)
@@ -661,6 +748,7 @@ class BlenderDevMCPServer:
         result["validation"] = reports
         return result
 
+    @command("annotate_node_tree")
     def annotate_node_tree(self, name, labels=None, frames=None):
         """Write labels and frames onto a geometry node tree."""
         tree = bpy.data.node_groups.get(name)
@@ -675,6 +763,7 @@ class BlenderDevMCPServer:
         undo.push(f"MCP annotate {name}")
         return result
 
+    @command("get_stderr_log")
     def get_stderr_log(self, max_chars=8000, clear=False):
         """Read back what Blender has written to stderr this session.
 
@@ -698,6 +787,27 @@ class BlenderDevMCPServer:
         }
 
 
+@bpy.app.handlers.persistent
+def _reset_undo_budget_on_load(_path):
+    """Drop the undo budget when a different file is loaded.
+
+    Blender clears its undo stack on load, but the push counter is module state
+    and would survive - leaving `undo_edit` convinced it owns steps that no
+    longer exist. Spending that stale budget would walk back through the
+    newly-loaded file's own history, which is the one thing the counter exists
+    to prevent. Must be @persistent, or the handler is itself unregistered by
+    the very load it needs to observe.
+    """
+    undo.reset()
+
+
+BlenderDevMCPServer.HANDLERS = {
+    fn._command_name: attr
+    for attr, fn in vars(BlenderDevMCPServer).items()
+    if callable(fn) and hasattr(fn, "_command_name")
+}
+
+
 # ----------------------------------------------------------------------
 # settings
 # ----------------------------------------------------------------------
@@ -705,15 +815,13 @@ class BlenderDevMCPServer:
 class BlenderDevMCPPreferences(bpy.types.AddonPreferences):
     """Port and auto-start, stored per user rather than per .blend.
 
-    These used to be bpy.types.Scene properties, which was wrong twice over.
-    A Scene property lives inside the .blend, so every scene in every file
-    carried its own opinion about a server there is only one of; and at startup
-    register() runs before any file is loaded, when bpy.context is a
-    _RestrictContext whose .scene is None - so the saved values could never be
-    read at the one moment auto-start needed them, and every launch silently
-    fell back to "port 9876, auto-start on" no matter what was saved.
+    Must not be Scene properties. A Scene property lives inside the .blend, so
+    every scene in every file would carry its own opinion about a server there
+    is only one of - and register() runs at startup before any file is loaded,
+    when bpy.context is a _RestrictContext whose .scene is None, so auto-start
+    could not read them at the one moment it needs them.
 
-    Preferences have neither problem: one copy per user, in userpref.blend, and
+    Preferences have neither problem: one copy per user in userpref.blend, and
     bpy.context.preferences is readable from inside the restricted context.
     """
 
@@ -801,9 +909,9 @@ class BLENDERDEVMCP_OT_StartServer(bpy.types.Operator):
         if server is None:
             server = bpy.types.blender_dev_mcp_server = BlenderDevMCPServer(port=port)
         elif server.port != port:
-            # Editing the port then pressing Start used to do nothing at all:
-            # the port was only read when the server object was constructed, and
-            # auto-start had already constructed one. Rebind onto the new port.
+            # Auto-start has usually already built a server on the old port, and
+            # the socket is bound at start() time - so moving to the prefs port
+            # means stopping and rebinding, not just assigning it.
             server.stop()
             server.port = port
         server.start()
@@ -846,6 +954,9 @@ def register():
 
     install_stderr_tee()
 
+    if _reset_undo_budget_on_load not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_reset_undo_budget_on_load)
+
     # Auto-start so the MCP client can connect without manual UI interaction.
     # Wrapped because an exception escaping register() makes Blender abandon the
     # whole addon - it prints one line, "Exception in module register()", and
@@ -874,6 +985,9 @@ def register():
 
 def unregister():
     remove_stderr_tee()
+
+    if _reset_undo_budget_on_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_reset_undo_budget_on_load)
 
     if getattr(bpy.types, "blender_dev_mcp_server", None):
         bpy.types.blender_dev_mcp_server.stop()

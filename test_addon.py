@@ -48,12 +48,11 @@ class FakeClient:
 
 
 def _drain(m, chunks):
-    """Run _handle_client over scripted chunks, returning parsed commands."""
-    server = m.BlenderDevMCPServer()
-    server.running = True
+    """Run the transport's read loop over scripted chunks, returning commands."""
     seen = []
-    server._dispatch_on_main_thread = lambda client, command: seen.append(command)
-    server._handle_client(FakeClient(chunks))
+    transport = m.SocketTransport(lambda client, command: seen.append(command))
+    transport.running = True
+    transport._handle_client(FakeClient(chunks))
     return seen
 
 
@@ -106,14 +105,13 @@ def test_garbage_does_not_dispatch_or_crash(m):
 
 
 def test_oversized_buffer_is_discarded(m):
-    server = m.BlenderDevMCPServer()
-    server.running = True
-    server.MAX_BUFFER = 64
     seen = []
-    server._dispatch_on_main_thread = lambda client, command: seen.append(command)
+    transport = m.SocketTransport(lambda client, command: seen.append(command))
+    transport.running = True
+    transport.MAX_BUFFER = 64
     # Never-parsing payload larger than the cap, then a valid command.
-    server._handle_client(FakeClient([b'{"junk": ' + b"x" * 200,
-                                      b'{"type": "after"}']))
+    transport._handle_client(FakeClient([b'{"junk": ' + b"x" * 200,
+                                         b'{"type": "after"}']))
     assert [c["type"] for c in seen] == ["after"], seen
 
 
@@ -124,47 +122,83 @@ def test_oversized_buffer_is_discarded(m):
 # a dead server instance and sending the reply nowhere.
 
 def test_stop_hangs_up_on_accepted_clients(m):
-    server = m.BlenderDevMCPServer()
-    server.running = True
+    transport = m.SocketTransport(lambda client, command: None)
+    transport.running = True
     clients = [FakeClient([]), FakeClient([])]
-    server._clients.update(clients)
+    transport._clients.update(clients)
 
-    server.stop()
+    transport.stop()
 
     for client in clients:
         assert client.shutdown_called, "peer must be told, not just our handle closed"
         assert client.closed, "accepted sockets must be closed by stop()"
-    assert not server._clients, "the client set must be emptied"
+    assert not transport._clients, "the client set must be emptied"
+
+
+def test_shutdown_socket_errors_are_not_reported_as_faults(m):
+    # stop() closes accepted sockets under their handler threads, so the OSError
+    # that follows is the designed exit path. Printing it trains the user to
+    # ignore the console, which is where real faults also go.
+    import io
+    from contextlib import redirect_stdout
+
+    transport = m.SocketTransport(lambda client, command: None)
+    transport.running = True
+
+    class DiesAsIfClosed(FakeClient):
+        def recv(self, _size):
+            transport.running = False           # stop() has run
+            raise OSError(10038, "not a socket")
+
+    out = io.StringIO()
+    with redirect_stdout(out):
+        transport._handle_client(DiesAsIfClosed([]))
+    assert "client handler error" not in out.getvalue(), out.getvalue()
+
+
+def test_socket_errors_while_serving_are_still_reported(m):
+    import io
+    from contextlib import redirect_stdout
+
+    transport = m.SocketTransport(lambda client, command: None)
+    transport.running = True
+
+    class Breaks(FakeClient):
+        def recv(self, _size):
+            raise OSError(9999, "something genuinely wrong")
+
+    out = io.StringIO()
+    with redirect_stdout(out):
+        transport._handle_client(Breaks([]))
+    assert "client handler error" in out.getvalue(), out.getvalue()
 
 
 def test_handler_deregisters_its_client_on_exit(m):
     # Otherwise the set grows for the life of the session and stop() would
     # shutdown() sockets that closed long ago.
-    server = m.BlenderDevMCPServer()
-    server.running = True
-    server._dispatch_on_main_thread = lambda client, command: None
+    transport = m.SocketTransport(lambda client, command: None)
+    transport.running = True
     client = FakeClient([b'{"type": "get_scene_info"}'])
-    server._clients.add(client)
+    transport._clients.add(client)
 
-    server._handle_client(client)
+    transport._handle_client(client)
 
-    assert not server._clients, "handler must remove its own client when it exits"
+    assert not transport._clients, "handler must remove its own client when it exits"
 
 
 def test_command_arriving_after_stop_is_not_executed(m):
     # The handler thread sits blocked in recv() across the stop, so `running`
     # has to be re-checked after the read, not only at the top of the loop.
-    server = m.BlenderDevMCPServer()
-    server.running = True
     seen = []
-    server._dispatch_on_main_thread = lambda client, command: seen.append(command)
+    transport = m.SocketTransport(lambda client, command: seen.append(command))
+    transport.running = True
 
     class StopsMidRecv(FakeClient):
         def recv(self, size):
-            server.running = False  # stop() lands while we are blocked here
+            transport.running = False  # stop() lands while we are blocked here
             return super().recv(size)
 
-    server._handle_client(StopsMidRecv([b'{"type": "execute_code"}']))
+    transport._handle_client(StopsMidRecv([b'{"type": "execute_code"}']))
 
     assert seen == [], "a stopped server must not execute what it happens to read"
 
@@ -176,7 +210,7 @@ def test_queued_command_is_discarded_if_the_server_stopped(m):
     import bpy
 
     server = m.BlenderDevMCPServer()
-    server.running = True
+    server.transport.running = True
     ran = []
     server.execute_command = lambda command: ran.append(command) or {"status": "success"}
 
@@ -190,7 +224,7 @@ def test_queued_command_is_discarded_if_the_server_stopped(m):
         bpy.app.timers.register = real_register
 
     assert queued, "expected the command to be queued on a timer"
-    server.running = False
+    server.transport.running = False
     queued[0]()
 
     assert ran == [], "a command queued by a now-stopped server must not run"
@@ -202,7 +236,7 @@ def test_queued_command_still_runs_while_the_server_is_up(m):
     import bpy
 
     server = m.BlenderDevMCPServer()
-    server.running = True
+    server.transport.running = True
     ran = []
     server.execute_command = lambda command: ran.append(command) or {"status": "success"}
 
@@ -219,6 +253,67 @@ def test_queued_command_still_runs_while_the_server_is_up(m):
 
 
 # ---------------------------------------------------------------- dispatch
+
+def test_handler_table_is_built_from_the_decorators(m):
+    decorated = {fn._command_name for fn in vars(m.BlenderDevMCPServer).values()
+                 if callable(fn) and hasattr(fn, "_command_name")}
+    assert decorated, "no @command handlers found - the table build is broken"
+    assert set(m.BlenderDevMCPServer.HANDLERS) == decorated, \
+        "HANDLERS drifted from the decorators that are supposed to define it"
+
+
+def test_command_names_are_unique(m):
+    # dict-building silently keeps the last duplicate, so a copy-pasted
+    # decorator would make one handler unreachable with no error anywhere.
+    names = [fn._command_name for fn in vars(m.BlenderDevMCPServer).values()
+             if callable(fn) and hasattr(fn, "_command_name")]
+    dupes = {n for n in names if names.count(n) > 1}
+    assert not dupes, f"duplicate @command names: {dupes}"
+
+
+def test_every_handler_is_callable_on_the_server(m):
+    server = m.BlenderDevMCPServer()
+    for name, attr in m.BlenderDevMCPServer.HANDLERS.items():
+        assert callable(getattr(server, attr, None)), \
+            f"{name} maps to {attr!r}, which is not a method"
+
+
+def test_server_exposes_the_transport_lifecycle(m):
+    # The panel and both operators drive the server object and never touch the
+    # transport, so these passthroughs are load-bearing UI API.
+    server = m.BlenderDevMCPServer(port=12345)
+    assert server.port == 12345, server.port
+    assert server.host == server.transport.host
+    assert server.running is False, "a fresh server must not claim to be running"
+
+    server.port = 12346
+    assert server.transport.port == 12346, "the port setter must reach the transport"
+
+    server.transport.running = True
+    assert server.running is True, "running must reflect the transport, not a copy"
+
+
+def test_start_and_stop_delegate_to_the_transport(m):
+    server = m.BlenderDevMCPServer()
+    calls = []
+    server.transport.start = lambda: calls.append("start")
+    server.transport.stop = lambda: calls.append("stop")
+
+    server.start()
+    server.stop()
+
+    assert calls == ["start", "stop"], calls
+
+
+def test_transport_needs_no_dispatcher(m):
+    # The point of the split: framing is testable with no Blender command in
+    # sight. If this ever needs a BlenderDevMCPServer, they have re-merged.
+    seen = []
+    transport = m.SocketTransport(lambda client, command: seen.append(command))
+    transport.running = True
+    transport._handle_client(FakeClient([b'{"type": "anything at all"}']))
+    assert [c["type"] for c in seen] == ["anything at all"], seen
+
 
 def test_unknown_command_lists_known(m):
     response = m.BlenderDevMCPServer().execute_command({"type": "nope"})
@@ -434,6 +529,38 @@ def test_settings_are_not_stored_on_the_scene(m):
     finally:
         m.unregister()
         m.BlenderDevMCPServer.start, m.BlenderDevMCPServer.stop = real_start, real_stop
+
+
+def test_undo_budget_is_cleared_when_a_file_is_loaded(m):
+    # Blender drops its undo stack on load; the push counter is module state and
+    # would not, leaving undo_edit convinced it owns steps that no longer exist.
+    # Spending that stale budget walks into the new file's own history.
+    m.undo.reset()
+    m.undo._pushed = 4
+    m._reset_undo_budget_on_load(None)
+    assert m.undo.budget() == 0, "a file load must void the budget"
+
+
+def test_load_handler_is_registered_and_persistent(m):
+    import bpy
+
+    real_start, real_stop = m.BlenderDevMCPServer.start, m.BlenderDevMCPServer.stop
+    m.BlenderDevMCPServer.start = lambda self: None
+    m.BlenderDevMCPServer.stop = lambda self: None
+    m.register()
+    try:
+        assert m._reset_undo_budget_on_load in bpy.app.handlers.load_post, \
+            "register() must hook load_post or the budget goes stale"
+        # Non-persistent handlers are removed by the very load they must
+        # observe. Blender marks the decorated function by *setting* the
+        # attribute, whose value is None - so test for presence, not truth.
+        assert "_bpy_persistent" in m._reset_undo_budget_on_load.__dict__, \
+            "the load handler must be @persistent"
+    finally:
+        m.unregister()
+        m.BlenderDevMCPServer.start, m.BlenderDevMCPServer.stop = real_start, real_stop
+    assert m._reset_undo_budget_on_load not in bpy.app.handlers.load_post, \
+        "unregister() must remove the handler again"
 
 
 def test_get_prefs_returns_none_when_addon_is_not_installed(m):

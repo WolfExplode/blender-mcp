@@ -19,6 +19,8 @@ from typing import Any, AsyncIterator, Dict
 
 from mcp.server.fastmcp import Context, FastMCP, Image
 
+from . import docs
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -118,11 +120,9 @@ class BlenderConnection:
             chunk = sock.recv(buffer_size)
             if not chunk:
                 if not chunks:
-                    # Raise the same type as a truncated reply. This used to be a
-                    # bare Exception, which matched none of the handlers in
-                    # _attempt and so escaped with the dead socket still cached --
-                    # every pooled-socket death then cost two failed calls instead
-                    # of being retried transparently.
+                    # Must be a type _attempt classifies as a transport failure.
+                    # Anything else escapes its handlers with the dead socket
+                    # still pooled, and the next call fails on it too.
                     raise IncompleteResponse(
                         "connection closed before any data arrived")
                 break
@@ -222,9 +222,10 @@ class BlenderConnection:
             raise Exception(f"Invalid response from Blender: {exc}") from exc
         except (OSError, IncompleteResponse) as exc:
             # Every transport failure lands here: refused, reset, aborted, closed
-            # early, truncated. OSError covers the whole errno family, so a new
-            # platform-specific code cannot slip through uncaught and leave a
-            # dead socket in the pool the way WSAECONNABORTED once did.
+            # early, truncated. Catch the whole OSError family rather than named
+            # subclasses - a platform errno that is not ConnectionError (Windows
+            # sends WSAECONNABORTED as a plain OSError) must not slip through and
+            # leave a dead socket pooled.
             self.disconnect()
             raise ConnectionDropped(str(exc) or type(exc).__name__) from exc
         except Exception:
@@ -600,6 +601,57 @@ def get_stderr_log(ctx: Context, max_chars: int = 8000, clear: bool = False) -> 
         header += f", truncated to last {max_chars} chars"
     header += "]"
     return f"{header}\n{text}"
+
+
+@mcp.tool()
+def blender_docs(ctx: Context, query: str, max_chars: int = 6000) -> str:
+    """Look something up in the offline Blender Python API reference and manual.
+
+    Use this BEFORE guessing at an API, and before reading Blender's C++ source:
+    these docs are version-stamped for the Blender this tooling drives, whereas
+    source trees track main and describe APIs that do not exist yet. Needs no
+    running Blender, so it also works when Blender is closed or busy.
+
+    Answers "does this exist, what is it called, what type is it, what are the
+    valid enum values". For a live value in the current scene, use
+    execute_blender_code instead.
+
+    Parameters:
+    - query: A symbol (`bpy.types.ChildOfConstraint`, `set_inverse_pending`) or,
+      failing that, a phrase to grep the manual prose for.
+    - max_chars: Cap on the page text returned (default 6000)
+    """
+    if docs.docs_root() is None:
+        raise Exception(
+            "Offline Blender docs are not installed. Expected them under "
+            "docs/Blender Documentation/ in the blender-mcp repo, or set "
+            f"{docs.DOCS_ENV} to point at a copy.")
+
+    _entries, version = docs.inventory()
+    stamp = f"[{version}]" if version else "[offline Blender docs]"
+
+    matches = docs.find_symbols(query)
+    if matches:
+        api = docs.api_dir()
+        name, kind, page = matches[0]
+        out = [f"{stamp} {name} ({kind})", ""]
+        out.append(docs.page_text(api / page, max_chars=max_chars))
+        if len(matches) > 1:
+            out.append("")
+            out.append(f"Other matches for {query!r}:")
+            out.extend(f"  {n} ({k})" for n, k, _ in matches[1:15])
+        return "\n".join(out)
+
+    hits = docs.search_prose(query)
+    if not hits:
+        return (f"{stamp} nothing found for {query!r}. Symbol lookup is exact-ish "
+                "-- try the unqualified name, or a phrase from the manual.")
+    out = [f"{stamp} no symbol named {query!r}; found it in the prose:", ""]
+    for path, snippet in hits:
+        out.append(f"--- {path}")
+        out.append(snippet)
+        out.append("")
+    return "\n".join(out)
 
 
 def main():

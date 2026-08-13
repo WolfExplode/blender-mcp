@@ -25,24 +25,23 @@ def _parse(path):
 
 
 def addon_handlers():
-    """{command name: (required args, all args)} from the addon's dispatch table."""
+    """{command name: (required args, all args)} from the @command decorators."""
     tree = _parse(ADDON)
     cls = next(n for n in ast.walk(tree)
                if isinstance(n, ast.ClassDef) and n.name == "BlenderDevMCPServer")
 
-    methods = {n.name: n for n in cls.body if isinstance(n, ast.FunctionDef)}
-
-    # handlers = {"get_scene_info": self.get_scene_info, ...}
-    table = next(n for n in ast.walk(cls)
-                 if isinstance(n, ast.Assign)
-                 and any(getattr(t, "id", None) == "handlers" for t in n.targets))
-
     contract = {}
-    for key, value in zip(table.value.keys, table.value.values):
-        method = methods[value.attr]
-        args = [a.arg for a in method.args.args if a.arg != "self"]
-        required = args[:len(args) - len(method.args.defaults)]
-        contract[key.value] = (set(required), set(args))
+    for method in (n for n in cls.body if isinstance(n, ast.FunctionDef)):
+        for deco in method.decorator_list:
+            # @command("get_scene_info")
+            if not (isinstance(deco, ast.Call)
+                    and getattr(deco.func, "id", None) == "command"):
+                continue
+            assert deco.args and isinstance(deco.args[0], ast.Constant), \
+                f"{method.name}: @command needs a literal name"
+            args = [a.arg for a in method.args.args if a.arg != "self"]
+            required = args[:len(args) - len(method.args.defaults)]
+            contract[deco.args[0].value] = (set(required), set(args))
     return contract
 
 
