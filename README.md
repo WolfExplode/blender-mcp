@@ -44,7 +44,8 @@ loading an addon file here will not fire its entry-point block.
 
 This drives whatever Blender is open, usually with unsaved work in it, and the
 one general-purpose tool takes arbitrary Python. Three things stand between that
-and a ruined afternoon, all of them built on Blender's own undo stack.
+and a ruined afternoon, all of them built on Blender's own undo stack — and one
+thing that is deliberately *not* here, described at the end of this section.
 
 **`dry_run=True` proposes an edit rather than making one.** Arbitrary Python
 cannot be analysed for what it would do, so the only truthful preview is to run
@@ -70,6 +71,20 @@ the escape hatch after a bulk edit spread over several calls. Note that one
 revert point is not one undo step — a labelled write pushes a boundary entry as
 well as its own, so taking back K of them costs 2K-1 raw steps. `undo.py` tracks
 that per edit; assuming otherwise silently under-reverts.
+
+### Where that stops
+
+All three unwind an edit from inside a living Blender, so none survive a
+segfault. **That gap is deliberately left open.**
+
+Saving and backups are the user's job. Driving Blender over MCP is inherently
+unsafe on work that has not been saved, and the answer is to save before
+pointing an agent at a file — not for the agent to invent a backup scheme on
+the user's behalf. Blender's own auto-save already covers the crash.
+
+The rule: **this tooling protects the user from the tooling, not from
+themselves.** Taking back what a session did is in scope, because nothing else
+can. Guarding the user's file against their own choices is not.
 
 ## Layout
 

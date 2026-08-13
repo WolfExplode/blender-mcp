@@ -20,6 +20,22 @@ one thing that is easy to get wrong is that a revert point is not a stack step.
 One tool, `blender_docs`, needs no Blender at all — it reads the offline docs
 described below, and is served entirely from `src/blender_dev_mcp/docs.py`.
 
+## Scope: what this tooling is not responsible for
+
+**Saving and backups are the user's job.** Do not add checkpointing, auto-save,
+project backup, or crash recovery. MCP writes are inherently unsafe on unsaved
+work, the user knows that, and the correct response is for them to save first.
+
+The line: **protect the user from this tooling, not from themselves.** Taking
+back what this session did is in scope — `undo.py`, `dry_run`,
+`rollback_on_error` — because nothing else can. Guarding the user's file against
+their own choices is out of scope, and so is duplicating what Blender already
+ships.
+
+A safety feature that insures an event the user already insures does not belong
+here however well built it is. Being careful and well-measured is not evidence
+it belongs.
+
 Nothing at runtime checks the two halves agree on the wire protocol, so
 `test_contract.py` does it statically by AST-scraping both files.
 
